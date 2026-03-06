@@ -1,0 +1,3 @@
+def build_ensemble_model(models, X_train, y_train):\n    from sklearn.ensemble import VotingClassifier\n    ensemble_model = VotingClassifier(estimators=models, voting='hard')\n    ensemble_model.fit(X_train, y_train)\n    return ensemble_model\n\n
+def feature_engineering(data):\n    # Example feature engineering steps\n    data['new_feature'] = data['feature1'] / data['feature2']  # Creating a new feature\n    return data\n\n
+def cross_validation(model, X, y, cv=5):\n    from sklearn.model_selection import cross_val_score\n    scores = cross_val_score(model, X, y, cv=cv)\n    return scores.mean(), scores.std()\n

@@ -1,7 +1,7 @@
 # NanoPred Project Documentation
 
 ## Overview
-NanoPred is a comprehensive project aimed at predicting percent identity between sequences by modelling it based on sequences and quality data. The project is divided into three main phases:
+NanoPred is a comprehensive project aimed at predicting percent identity between high error-rate (e.g. Nanopore) sequencing data by modelling it based on sequences and quality data. The aim is to allow OTU clustering accounting for sequence quality. The project is divided into three main phases:
 
 1. **In-Silico Dataset Creation**  
 2. **Ensemble ML Model Building**  
@@ -45,7 +45,7 @@ NanoPred is a comprehensive project aimed at predicting percent identity between
 ---
 
 ## Conclusion
-NanoPred aims to deliver a robust framework for biological data prediction through advanced methodologies in machine learning and statistics. By documenting our approach comprehensively, we provide future users and researchers with insights into our process and outcomes.  
+NanoPred aims to deliver a robust framework for sequence pairwise identity prediction through machine learning methods based on quality and sequence data. By documenting our approach comprehensively, we provide future users and researchers with insights into our process and outcomes.  
 
 ## Acknowledgments
 - Special thanks to contributors and data scientists involved in the development of this project.

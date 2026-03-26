@@ -1,7 +1,7 @@
 # NanoPred Project Documentation
 
 ## Overview
-NanoPred is a comprehensive project aimed at predicting biological outcomes using machine learning techniques. The project is divided into three main phases:
+NanoPred is a comprehensive project aimed at predicting percent identity between sequences by modelling it based on sequences and quality data. The project is divided into three main phases:
 
 1. **In-Silico Dataset Creation**  
 2. **Ensemble ML Model Building**  

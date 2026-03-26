@@ -11,7 +11,7 @@ NanoPred is a comprehensive project aimed at predicting percent identity between
 
 ## Phase 1: In-Silico Dataset Creation with Adaptive Primer Trimming and K-Means Clustering
 ### 1.1 Dataset Creation
-- Generate synthetic datasets that mimic real biological data.
+- Generate synthetic datasets that mimic pairwise comparisons of sequences based on SILVA database.
 - Utilize adaptive primer trimming techniques to refine input sequences.
 
 ### 1.2 K-Means Clustering

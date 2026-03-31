@@ -47,5 +47,12 @@ NanoPred is a comprehensive project aimed at predicting percent identity between
 ## Conclusion
 NanoPred aims to deliver a robust framework for sequence pairwise identity prediction through machine learning methods based on quality and sequence data. By documenting our approach comprehensively, we provide future users and researchers with insights into our process and outcomes.  
 
+## Primer Trimming
+
+This project uses [`cutPrimers`](https://github.com/aakechin/cutPrimers) by Chin et al. for precise primer detection and trimming.  
+If you use this workflow, please cite:
+
+> Chin, A., et al. (2022). cutPrimers: A new tool for accurate primer removal in amplicon sequencing. Bioinformatics, 38(10): 2912–2914. https://doi.org/10.1093/bioinformatics/btac260
+
 ## Acknowledgments
 - Special thanks to contributors and data scientists involved in the development of this project.

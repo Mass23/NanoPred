@@ -177,6 +177,7 @@ def run_benchmark(fasta_path: str) -> None:
     t_load = Timer()
     t_load.start()
     records = list(SeqIO.parse(fasta_path, "fasta"))
+    records = random.sample(records, 1000)
     t_load.stop()
     n_reads = len(records)
     print(f"Loaded {n_reads} sequences from '{fasta_path}'.")

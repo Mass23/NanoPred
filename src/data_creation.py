@@ -12,6 +12,7 @@ import hashlib
 import subprocess
 import tempfile
 from collections import Counter
+from typing import List, Union
 
 import numpy as np
 import pandas as pd
@@ -425,7 +426,7 @@ def compute_pair_features(m1: dict, m2: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def generate_dataset(
-    fasta_path: str,
+    fasta_paths: Union[str, List[str]],
     num_pairs: int,
     output_csv: str,
     primer5: str = '',
@@ -437,7 +438,9 @@ def generate_dataset(
     Generate a dataset of num_pairs sequence pairs with computed features.
 
     Args:
-        fasta_path:  Path to input FASTA file.
+        fasta_paths: Path (str) or list of paths to input FASTA file(s).
+                     When multiple files are provided, all sequences are pooled
+                     together before pair generation.
         num_pairs:   Number of pairs to generate (e.g. 500_000).
         output_csv:  Output CSV path.
         primer5:     Forward primer sequence (optional).
@@ -449,11 +452,20 @@ def generate_dataset(
     random.seed(seed)
     rng = np.random.default_rng(seed)
 
-    print(f"Loading sequences from {fasta_path} ...")
-    sequences = load_fasta(fasta_path)
+    # Accept a single path string for backward compatibility.
+    if isinstance(fasta_paths, str):
+        fasta_paths = [fasta_paths]
+
+    sequences = []
+    for fasta_path in fasta_paths:
+        print(f"Loading sequences from {fasta_path} ...")
+        loaded = load_fasta(fasta_path)
+        print(f"  Loaded {len(loaded)} sequences.")
+        sequences.extend(loaded)
+
     if not sequences:
-        raise ValueError(f"No sequences found in {fasta_path}")
-    print(f"  Loaded {len(sequences)} sequences.")
+        raise ValueError(f"No sequences found in {fasta_paths}")
+    print(f"Total sequences loaded: {len(sequences)}")
 
     print(f"Creating {num_pairs} pairs ...")
     pairs = create_sequence_pairs(sequences, num_pairs, seed=seed)

@@ -4,6 +4,10 @@ data_creation.py - CLI entry point for generating the NanoPred training dataset.
 Usage:
     python data_creation.py -f sequences.fasta -o all_pairs_data.csv \
         [-n 500000] [-p1 PRIMER5] [-p2 PRIMER3] [--seed 42] [--chunk-size 1000]
+
+    Multiple FASTA files can be provided as a comma-separated list:
+    python data_creation.py -f file1.fasta,file2.fasta,file3.fasta \
+        -o all_pairs_data.csv -n 500000
 """
 
 import argparse
@@ -17,7 +21,11 @@ def main():
     parser.add_argument(
         "-f", "--fasta",
         required=True,
-        help="Path to input FASTA file containing reference sequences.",
+        help=(
+            "Path(s) to input FASTA file(s) containing reference sequences. "
+            "Multiple files can be provided as a comma-separated list "
+            "(e.g. file1.fasta,file2.fasta,file3.fasta)."
+        ),
     )
     parser.add_argument(
         "-o", "--output",
@@ -54,8 +62,10 @@ def main():
     )
     args = parser.parse_args()
 
+    fasta_paths = [p.strip() for p in args.fasta.split(',') if p.strip()]
+
     generate_dataset(
-        fasta_path=args.fasta,
+        fasta_paths=fasta_paths,
         num_pairs=args.num_pairs,
         output_csv=args.output,
         primer5=args.primer5,

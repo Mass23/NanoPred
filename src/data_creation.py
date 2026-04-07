@@ -104,7 +104,13 @@ def _run_cutprimers(input_fasta: str, output_fasta: str, primer5: str, primer3: 
             '--output', output_fasta,
             '--outputDiscarded', '/dev/null',
         ]
-        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            # Allow up to 60 s per invocation; individual files are small
+            # (single sequences) so this is more than sufficient.
+            timeout=60,
+        )
         if result.returncode == 0 and os.path.exists(output_fasta):
             return output_fasta
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -245,15 +251,21 @@ def _hash_to_bits(data: bytes, num_bits: int) -> np.ndarray:
 
 
 def dna_binary_hash(seq: str, num_bits: int) -> np.ndarray:
-    """Convert DNA sequence to binary then hash to num_bits."""
-    mapping = {'A': '00', 'T': '01', 'G': '10', 'C': '11', 'N': '00'}
+    """
+    Convert DNA sequence to binary then hash to num_bits.
+    Mapping: A=00, T=01, G=10, C=11.  Ambiguous/unknown bases (e.g. N) are
+    encoded as 00 (same as A) because they represent masked positions and carry
+    no distinct information in the binary representation.
+    """
+    mapping = {'A': '00', 'T': '01', 'G': '10', 'C': '11'}
     binary_str = ''.join(mapping.get(b, '00') for b in seq.upper())
     return _hash_to_bits(binary_str.encode(), num_bits)
 
 
 def quality_hash(quality_scores: list, num_bits: int) -> np.ndarray:
-    """Hash quality score array to num_bits."""
-    data = bytes(min(q, 255) for q in quality_scores)
+    """Hash quality score array to num_bits. Phred scores are capped at 93
+    (the maximum valid Phred+33 FASTQ value) before encoding."""
+    data = bytes(min(q, 93) for q in quality_scores)
     return _hash_to_bits(data, num_bits)
 
 
@@ -457,8 +469,11 @@ def generate_dataset(
                     row.update(pair_feats)
                     chunk_rows.append(row)
 
-                except Exception:
-                    # Skip problematic pairs
+                except (ValueError, TypeError, ZeroDivisionError, StopIteration) as exc:
+                    # Skip pairs that fail due to empty/invalid sequences or
+                    # alignment edge cases; log the reason for debugging.
+                    import warnings
+                    warnings.warn(f"Skipping pair due to error: {exc}")
                     continue
 
             if chunk_rows:

@@ -420,110 +420,109 @@ def run_benchmarks(
     Returns the list of :class:`BenchmarkResult` objects.
     """
     results: List[BenchmarkResult] = []
-    tmpdir_obj = tempfile.TemporaryDirectory()
-    tmpdir = tmpdir_obj.name
 
-    # ------------------------------------------------------------------
-    # Prepare data
-    # ------------------------------------------------------------------
-    print(f"Preparing test data ({n_sequences} sequences) …")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # ------------------------------------------------------------------
+        # Prepare data
+        # ------------------------------------------------------------------
+        print(f"Preparing test data ({n_sequences} sequences) …")
 
-    if fasta_path and fastq_path:
-        # Load from provided files
-        fasta_records = load_fasta(fasta_path)[:n_sequences]
-        fastq_records = load_fastq(fastq_path)[:n_sequences]
-        print(f"  Loaded {len(fasta_records)} FASTA and {len(fastq_records)} FASTQ records.")
-    else:
-        # Generate synthetic data
-        fastq_records = generate_test_records(n=n_sequences, with_primers=True)
-        # Strip quality for FASTA records (re-use same sequences)
-        fasta_records = [
-            SeqRecord(rec.seq, id=rec.id, description=rec.description)
-            for rec in fastq_records
+        if fasta_path and fastq_path:
+            # Load from provided files
+            fasta_records = load_fasta(fasta_path)[:n_sequences]
+            fastq_records = load_fastq(fastq_path)[:n_sequences]
+            print(f"  Loaded {len(fasta_records)} FASTA and {len(fastq_records)} FASTQ records.")
+        else:
+            # Generate synthetic data
+            fastq_records = generate_test_records(n=n_sequences, with_primers=True)
+            # Strip quality for FASTA records (re-use same sequences)
+            fasta_records = [
+                SeqRecord(rec.seq, id=rec.id, description=rec.description)
+                for rec in fastq_records
+            ]
+            fasta_path = os.path.join(tmpdir, "test.fasta")
+            fastq_path = os.path.join(tmpdir, "test.fastq")
+            _write_fasta(fasta_records, fasta_path)
+            _write_fastq(fastq_records, fastq_path)
+            print(f"  Generated {n_sequences} synthetic sequences.")
+
+        sequences: List[str] = [str(r.seq) for r in fasta_records]
+        quality_lists: List[List[int]] = [
+            r.letter_annotations.get("phred_quality", []) for r in fastq_records
         ]
-        fasta_path = os.path.join(tmpdir, "test.fasta")
-        fastq_path = os.path.join(tmpdir, "test.fastq")
-        _write_fasta(fasta_records, fasta_path)
-        _write_fastq(fastq_records, fastq_path)
-        print(f"  Generated {n_sequences} synthetic sequences.")
 
-    sequences: List[str] = [str(r.seq) for r in fasta_records]
-    quality_lists: List[List[int]] = [
-        r.letter_annotations.get("phred_quality", []) for r in fastq_records
-    ]
+        # ------------------------------------------------------------------
+        # 1. Load FASTA
+        # ------------------------------------------------------------------
+        print("\n[1/8] Loading FASTA …")
+        results.append(bench_load_fasta(fasta_path, warmup=warmup, repeats=repeats))
 
-    # ------------------------------------------------------------------
-    # 1. Load FASTA
-    # ------------------------------------------------------------------
-    print("\n[1/8] Loading FASTA …")
-    results.append(bench_load_fasta(fasta_path, warmup=warmup, repeats=repeats))
+        # ------------------------------------------------------------------
+        # 2. Load FASTQ
+        # ------------------------------------------------------------------
+        print("[2/8] Loading FASTQ …")
+        results.append(bench_load_fastq(fastq_path, warmup=warmup, repeats=repeats))
 
-    # ------------------------------------------------------------------
-    # 2. Load FASTQ
-    # ------------------------------------------------------------------
-    print("[2/8] Loading FASTQ …")
-    results.append(bench_load_fastq(fastq_path, warmup=warmup, repeats=repeats))
-
-    # ------------------------------------------------------------------
-    # 3. Primer trimming
-    # ------------------------------------------------------------------
-    if skip_primers:
-        print("[3/8] Primer trimming … [SKIPPED via --skip-primers]")
-    else:
-        print("[3/8] Primer trimming …")
-        results.append(
-            bench_trim_primers(
-                fastq_records,
-                primer5=primer5,
-                primer3=primer3,
-                fmt="fastq",
-                warmup=1,
-                repeats=max(1, repeats // 2),
+        # ------------------------------------------------------------------
+        # 3. Primer trimming
+        # ------------------------------------------------------------------
+        if skip_primers:
+            print("[3/8] Primer trimming … [SKIPPED via --skip-primers]")
+        else:
+            print("[3/8] Primer trimming …")
+            results.append(
+                bench_trim_primers(
+                    fastq_records,
+                    primer5=primer5,
+                    primer3=primer3,
+                    fmt="fastq",
+                    warmup=1,
+                    repeats=max(1, repeats // 2),
+                )
             )
-        )
 
-    # ------------------------------------------------------------------
-    # 4. GC content
-    # ------------------------------------------------------------------
-    print("[4/8] GC content …")
-    results.append(bench_gc_content(sequences, warmup=warmup, repeats=repeats))
+        # ------------------------------------------------------------------
+        # 4. GC content
+        # ------------------------------------------------------------------
+        print("[4/8] GC content …")
+        results.append(bench_gc_content(sequences, warmup=warmup, repeats=repeats))
 
-    # ------------------------------------------------------------------
-    # 5. DNA → binary hash (64 / 128 / 256 bits)
-    # ------------------------------------------------------------------
-    print("[5/8] DNA binary hash …")
-    for bits in (64, 128, 256):
-        results.append(bench_dna_binary_hash(sequences, hash_bits=bits, warmup=warmup, repeats=repeats))
-
-    # ------------------------------------------------------------------
-    # 6. Sequence length
-    # ------------------------------------------------------------------
-    print("[6/8] Sequence length …")
-    results.append(bench_sequence_length(sequences, warmup=warmup, repeats=repeats))
-
-    # ------------------------------------------------------------------
-    # 7. K-mer hashes (k = 3, 5, 7; hash sizes = 64, 128, 256)
-    # ------------------------------------------------------------------
-    print("[7/8] K-mer hashes …")
-    for k in (3, 5, 7):
+        # ------------------------------------------------------------------
+        # 5. DNA → binary hash (64 / 128 / 256 bits)
+        # ------------------------------------------------------------------
+        print("[5/8] DNA binary hash …")
         for bits in (64, 128, 256):
-            results.append(bench_kmer_hashes(sequences, k=k, hash_bits=bits, warmup=warmup, repeats=repeats))
+            results.append(bench_dna_binary_hash(sequences, hash_bits=bits, warmup=warmup, repeats=repeats))
 
-    # ------------------------------------------------------------------
-    # 8. Quality stats + quality hash
-    # ------------------------------------------------------------------
-    print("[8/8] Quality stats and quality hashing …")
-    results.append(bench_quality_stats(quality_lists, warmup=warmup, repeats=repeats))
-    for bits in (64, 128, 256):
-        results.append(bench_quality_hash(quality_lists, hash_bits=bits, warmup=warmup, repeats=repeats))
+        # ------------------------------------------------------------------
+        # 6. Sequence length
+        # ------------------------------------------------------------------
+        print("[6/8] Sequence length …")
+        results.append(bench_sequence_length(sequences, warmup=warmup, repeats=repeats))
 
-    # ------------------------------------------------------------------
-    # Combined pipeline
-    # ------------------------------------------------------------------
-    print("\n[+] Combined pipeline …")
-    results.append(
-        bench_combined_pipeline(sequences, quality_lists, warmup=warmup, repeats=repeats)
-    )
+        # ------------------------------------------------------------------
+        # 7. K-mer hashes (k = 3, 5, 7; hash sizes = 64, 128, 256)
+        # ------------------------------------------------------------------
+        print("[7/8] K-mer hashes …")
+        for k in (3, 5, 7):
+            for bits in (64, 128, 256):
+                results.append(bench_kmer_hashes(sequences, k=k, hash_bits=bits, warmup=warmup, repeats=repeats))
+
+        # ------------------------------------------------------------------
+        # 8. Quality stats + quality hash
+        # ------------------------------------------------------------------
+        print("[8/8] Quality stats and quality hashing …")
+        results.append(bench_quality_stats(quality_lists, warmup=warmup, repeats=repeats))
+        for bits in (64, 128, 256):
+            results.append(bench_quality_hash(quality_lists, hash_bits=bits, warmup=warmup, repeats=repeats))
+
+        # ------------------------------------------------------------------
+        # Combined pipeline
+        # ------------------------------------------------------------------
+        print("\n[+] Combined pipeline …")
+        results.append(
+            bench_combined_pipeline(sequences, quality_lists, warmup=warmup, repeats=repeats)
+        )
 
     # ------------------------------------------------------------------
     # Output
@@ -546,7 +545,6 @@ def run_benchmarks(
             json.dump(data, fh, indent=2)
         print(f"\nResults saved to {output}")
 
-    tmpdir_obj.cleanup()
     return results
 
 

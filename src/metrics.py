@@ -312,7 +312,7 @@ def _hash_bytes(data: bytes, hash_bits: int) -> bytes:
     if hash_bits == 64:
         return hashlib.sha256(data).digest()[:8]
     elif hash_bits == 128:
-        return hashlib.md5(data).digest()  # noqa: S324 – non-crypto use
+        return hashlib.md5(data).digest()  # noqa: S324 - non-crypto use
     elif hash_bits == 256:
         return hashlib.sha256(data).digest()
     else:

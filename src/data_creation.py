@@ -25,12 +25,19 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 
 def load_fasta(fasta_path: str) -> list:
-    """Load sequences from a FASTA file. Returns list of (id, sequence) tuples."""
+    """Load sequences from a FASTA file. Returns list of (id, sequence) tuples.
+
+    RNA sequences (containing 'U') are automatically converted to DNA by
+    replacing every 'U' with 'T'.
+    """
     records = []
     with open(fasta_path, 'r') as fh:
         for record in SeqIO.parse(fh, 'fasta'):
             seq = str(record.seq).upper()
             if len(seq) > 0:
+                if 'U' in seq:
+                    print(f"  Converting RNA to DNA for sequence: {record.id}")
+                    seq = seq.replace('U', 'T')
                 records.append((record.id, seq))
     return records
 

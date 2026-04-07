@@ -24,14 +24,34 @@ from tqdm import tqdm
 # FASTA loading
 # ---------------------------------------------------------------------------
 
+def rna_to_dna(sequence: str) -> str:
+    """Convert an RNA sequence to DNA by replacing 'U' with 'T'.
+
+    Also normalises the sequence to uppercase so that downstream processing
+    works consistently regardless of the input case.
+    """
+    seq = sequence.upper()
+    return seq.replace('U', 'T')
+
+
 def load_fasta(fasta_path: str) -> list:
-    """Load sequences from a FASTA file. Returns list of (id, sequence) tuples."""
+    """Load sequences from a FASTA file. Returns list of (id, sequence) tuples.
+
+    RNA sequences (containing 'U') are automatically converted to DNA.
+    All sequences are normalised to uppercase.
+    """
     records = []
+    converted = 0
     with open(fasta_path, 'r') as fh:
         for record in SeqIO.parse(fh, 'fasta'):
-            seq = str(record.seq).upper()
+            raw = str(record.seq)
+            if 'U' in raw.upper():
+                converted += 1
+            seq = rna_to_dna(raw)
             if len(seq) > 0:
                 records.append((record.id, seq))
+    if converted:
+        print(f"  Converted {converted} RNA sequence(s) to DNA in {fasta_path}.")
     return records
 
 

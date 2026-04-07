@@ -113,12 +113,9 @@ def compute_kmer_hash(sequence: str, k: int, hash_size: int) -> str:
 def compute_quality_stats(quality_string: str) -> dict:
     """Return mean, median, q25, and q75 of the per-position Phred scores."""
     scores = [ord(c) - 33 for c in quality_string]
-    sorted_scores = sorted(scores)
-    n = len(sorted_scores)
-    mean = sum(sorted_scores) / n
-    median = statistics.median(sorted_scores)
-    q25 = sorted_scores[int(n * 0.25)]
-    q75 = sorted_scores[int(n * 0.75)]
+    mean = sum(scores) / len(scores)
+    median = statistics.median(scores)
+    q25, q75 = statistics.quantiles(scores, n=4)[0], statistics.quantiles(scores, n=4)[2]
     return {"mean": mean, "median": median, "q25": q25, "q75": q75}
 
 

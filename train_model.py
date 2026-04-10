@@ -15,9 +15,9 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
+from scipy.stats import pearsonr, spearmanr
 from sklearn.base import clone
-from sklearn.linear_model import ElasticNet, Lasso, Ridge
+from sklearn.linear_model import ElasticNet, LinearRegression, Ridge
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold
@@ -106,29 +106,64 @@ def expand_features(X: pd.DataFrame) -> pd.DataFrame:
 # FEATURE SELECTION
 # =========================================================
 
-def select_topn_spearman(X: pd.DataFrame, y: pd.Series, n: int) -> list:
+def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -> list:
     """
-    Select the top-n features by absolute Spearman correlation with the target.
+    Select the top-n features using a combined ranking of three metrics:
+      1. |Spearman correlation| with target
+      2. |Pearson correlation| with target
+      3. RandomForest feature importance (trained on X, y)
+
+    Each metric is converted to a rank (rank 1 = best score).  The average
+    rank across the three metrics is computed per feature; features with the
+    lowest average rank are selected.
+
+    All computations use only the data passed in (no leakage when called on
+    training data exclusively).
 
     Args:
-        X: Feature DataFrame.
-        y: Target Series.
+        X: Feature DataFrame (training data only).
+        y: Target Series (training data only).
         n: Number of features to select.
+        seed: Random seed for the RandomForest (default: 0).
 
     Returns:
-        List of column names (top n by |Spearman r|).
+        List of column names (top n by lowest average rank).
     """
-    corrs = {}
-    for col in X.columns:
+    cols = X.columns.tolist()
+    y_vals = y.values
+
+    spearman_scores = []
+    pearson_scores  = []
+    for col in cols:
         vals = X[col].values
         if np.std(vals) == 0:
-            corrs[col] = 0.0
+            spearman_scores.append(0.0)
+            pearson_scores.append(0.0)
         else:
-            r, _ = spearmanr(vals, y.values)
-            corrs[col] = abs(r) if not np.isnan(r) else 0.0
+            r_sp, _ = spearmanr(vals, y_vals)
+            r_pe, _ = pearsonr(vals, y_vals)
+            spearman_scores.append(abs(r_sp) if not np.isnan(r_sp) else 0.0)
+            pearson_scores.append(abs(r_pe) if not np.isnan(r_pe) else 0.0)
 
-    sorted_feats = sorted(corrs, key=corrs.get, reverse=True)
-    return sorted_feats[:n]
+    rf = RandomForestRegressor(n_estimators=100, random_state=seed, n_jobs=-1)
+    rf.fit(X, y_vals)
+    rf_scores = list(rf.feature_importances_)
+
+    def to_rank(scores: list) -> np.ndarray:
+        """Rank scores so that the highest score gets rank 1."""
+        arr = np.array(scores, dtype=float)
+        order = np.argsort(-arr)      # descending sort → best first
+        ranks = np.empty_like(order)
+        ranks[order] = np.arange(1, len(arr) + 1)
+        return ranks
+
+    ranks_sp = to_rank(spearman_scores)
+    ranks_pe = to_rank(pearson_scores)
+    ranks_rf = to_rank(rf_scores)
+    avg_rank  = (ranks_sp + ranks_pe + ranks_rf) / 3.0
+
+    ranked_cols = sorted(zip(cols, avg_rank), key=lambda x: x[1])
+    return [col for col, _ in ranked_cols[:n]]
 
 
 # =========================================================
@@ -146,10 +181,8 @@ def get_base_regressors(seed: int = 23) -> list:
         List of (name, model) tuples.
     """
     return [
-        # Linear regularised models
-        ("Lasso_a1e-3",    Lasso(alpha=1e-3, max_iter=1000, random_state=seed)),
-        ("Lasso_a1e-2",    Lasso(alpha=1e-2, max_iter=1000, random_state=seed)),
-        ("Lasso_a1e-1",    Lasso(alpha=1e-1, max_iter=1000, random_state=seed)),
+        # Linear models
+        ("LinearRegression", LinearRegression()),
         ("Ridge_a1e-1",    Ridge(alpha=1e-1)),
         ("Ridge_a1",       Ridge(alpha=1.0)),
         ("Ridge_a10",      Ridge(alpha=10.0)),
@@ -267,7 +300,7 @@ def train_and_evaluate_ensemble(
     """
     # ----- Step 1: evaluate all base models on each feature set -----
     all_model_results = []
-    for n_features in [5, 10, 20]:
+    for n_features in [3, 7, 14, 21]:
         all_model_results.extend(
             evaluate_models_on_feature_set(
                 base_models, X_train, y_train, n_features, feature_sets,
@@ -522,10 +555,10 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 3. Feature selection (Spearman correlation on training set)
     # ------------------------------------------------------------------
-    print("\n3. Selecting features via Spearman correlation...")
+    print("\n3. Selecting features via combined ranking (Spearman + Pearson + RF importance)...")
     feature_sets = {}
-    for n_feat in [5, 10, 20]:
-        feature_sets[n_feat] = select_topn_spearman(X_train_scaled, y_train, n_feat)
+    for n_feat in [3, 7, 14, 21]:
+        feature_sets[n_feat] = select_topn_combined(X_train_scaled, y_train, n_feat, seed=args.seed)
         print(f"  Top {n_feat}: {feature_sets[n_feat]}")
 
     # ------------------------------------------------------------------

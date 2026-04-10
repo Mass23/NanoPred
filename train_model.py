@@ -186,9 +186,11 @@ def evaluate_models_on_feature_set(
     n_features: int,
     feature_sets: dict,
     seed: int = 23,
+    n_repeats: int = 3,
 ) -> list:
     """
-    Evaluate all base models on a specific feature set using 3-fold CV.
+    Evaluate all base models on a specific feature set using 3-fold CV repeated
+    n_repeats times (default 3) to obtain stable performance estimates.
 
     Returns:
         List of (name, model, n_features, mean_cv_r2) tuples.
@@ -196,22 +198,24 @@ def evaluate_models_on_feature_set(
     features = feature_sets[n_features]
     X_sel = X_train[features]
 
-    kf = KFold(n_splits=3, shuffle=True, random_state=seed)
     model_results = []
 
-    print(f"  Evaluating base models for top {n_features} features:")
+    print(f"  Evaluating base models for top {n_features} features "
+          f"({n_repeats} repeated splits):")
     for name, model in base_models:
         scores = []
-        for tr_idx, val_idx in kf.split(X_sel):
-            X_tr  = X_sel.iloc[tr_idx]
-            X_val = X_sel.iloc[val_idx]
-            y_tr  = y_train.iloc[tr_idx]
-            y_val = y_train.iloc[val_idx]
+        for repeat in range(n_repeats):
+            kf = KFold(n_splits=3, shuffle=True, random_state=seed + repeat)
+            for tr_idx, val_idx in kf.split(X_sel):
+                X_tr  = X_sel.iloc[tr_idx]
+                X_val = X_sel.iloc[val_idx]
+                y_tr  = y_train.iloc[tr_idx]
+                y_val = y_train.iloc[val_idx]
 
-            m = clone(model)
-            m.fit(X_tr, y_tr)
-            y_pred = m.predict(X_val)
-            scores.append(r2_score(y_val, y_pred))
+                m = clone(model)
+                m.fit(X_tr, y_tr)
+                y_pred = m.predict(X_val)
+                scores.append(r2_score(y_val, y_pred))
 
         mean_r2 = float(np.mean(scores))
         print(f"    {name:25s} CV R² = {mean_r2:.4f}")
@@ -243,7 +247,7 @@ def train_and_evaluate_ensemble(
     """
     # ----- Step 1: evaluate all base models on each feature set -----
     all_model_results = []
-    for n_features in [10, 20, 30]:
+    for n_features in [5, 10, 20]:
         all_model_results.extend(
             evaluate_models_on_feature_set(
                 base_models, X_train, y_train, n_features, feature_sets, seed=seed
@@ -339,7 +343,7 @@ def train_and_evaluate_ensemble(
 # SAVING MODELS AND RESULTS
 # =========================================================
 
-def save_models(output_dir: str, result: dict) -> None:
+def save_models(output_dir: str, result: dict, feature_scaler: StandardScaler = None) -> None:
     """
     Save trained base models, feature sets, and ensemble metadata to disk.
 
@@ -347,6 +351,7 @@ def save_models(output_dir: str, result: dict) -> None:
         output_dir/
             <ModelName>_top<N>.pkl          – trained base model
             <ModelName>_top<N>_features.pkl – list of selected feature names
+            feature_scaler.pkl              – StandardScaler fit on training features
             ensemble_metadata.pkl           – which models/features used + weights
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -357,6 +362,10 @@ def save_models(output_dir: str, result: dict) -> None:
         feats_path  = os.path.join(output_dir, f"{safe_name}_top{n_feat}_features.pkl")
         joblib.dump(model, model_path)
         joblib.dump(feats,  feats_path)
+
+    # Save feature scaler
+    if feature_scaler is not None:
+        joblib.dump(feature_scaler, os.path.join(output_dir, 'feature_scaler.pkl'))
 
     # Save meta-learner
     joblib.dump(result['meta_learner'], os.path.join(output_dir, 'meta_learner.pkl'))
@@ -427,8 +436,8 @@ def main() -> None:
     parser.add_argument(
         '--top-k',
         type=int,
-        default=5,
-        help='Number of top base models to include in the ensemble (default: 5).',
+        default=10,
+        help='Number of top base models to include in the ensemble (default: 10).',
     )
     parser.add_argument(
         '--seed',
@@ -449,6 +458,13 @@ def main() -> None:
     X, y = load_and_prepare_data(args.input)
 
     # ------------------------------------------------------------------
+    # 1b. Feature expansion (log + sqrt variants)
+    # ------------------------------------------------------------------
+    print("\n1b. Expanding features (log and sqrt variants)...")
+    X = expand_features(X)
+    print(f"  Features after expansion: {X.shape[1]}")
+
+    # ------------------------------------------------------------------
     # 2. Train / test split
     # ------------------------------------------------------------------
     print("\n2. Splitting into train/test sets...")
@@ -467,12 +483,28 @@ def main() -> None:
     print(f"  Train: {len(X_train):,} rows   Test: {len(X_test):,} rows")
 
     # ------------------------------------------------------------------
+    # 2b. Feature scaling (fit on training data only, apply to both sets)
+    # ------------------------------------------------------------------
+    print("\n2b. Scaling features (StandardScaler fit on training data only)...")
+    feature_scaler = StandardScaler()
+    X_train_scaled = pd.DataFrame(
+        feature_scaler.fit_transform(X_train),
+        columns=X_train.columns,
+        index=X_train.index,
+    )
+    X_test_scaled = pd.DataFrame(
+        feature_scaler.transform(X_test),
+        columns=X_test.columns,
+        index=X_test.index,
+    )
+
+    # ------------------------------------------------------------------
     # 3. Feature selection (Spearman correlation on training set)
     # ------------------------------------------------------------------
     print("\n3. Selecting features via Spearman correlation...")
     feature_sets = {}
-    for n_feat in [10, 20, 30]:
-        feature_sets[n_feat] = select_topn_spearman(X_train, y_train, n_feat)
+    for n_feat in [5, 10, 20]:
+        feature_sets[n_feat] = select_topn_spearman(X_train_scaled, y_train, n_feat)
         print(f"  Top {n_feat}: {feature_sets[n_feat]}")
 
     # ------------------------------------------------------------------
@@ -487,7 +519,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     print("\n5. Evaluating base models and training ensemble...")
     result = train_and_evaluate_ensemble(
-        X_train, y_train, X_test, y_test,
+        X_train_scaled, y_train, X_test_scaled, y_test,
         feature_sets, base_models,
         top_k=args.top_k,
         seed=args.seed,
@@ -497,7 +529,7 @@ def main() -> None:
     # 6. Save models and results
     # ------------------------------------------------------------------
     print("\n6. Saving models and results...")
-    save_models(args.output_dir, result)
+    save_models(args.output_dir, result, feature_scaler=feature_scaler)
     save_results(args.results, result)
 
     # ------------------------------------------------------------------

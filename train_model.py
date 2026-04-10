@@ -130,10 +130,10 @@ def get_base_regressors(seed: int = 23) -> list:
         ("ElasticNet_l1_08", ElasticNet(alpha=1e-2, l1_ratio=0.8, max_iter=5000, random_state=seed)),
 
         # Random Forest
-        ("RF_md4",   RandomForestRegressor(n_estimators=100, max_depth=4,  random_state=seed, n_jobs=-1)),
-        ("RF_md8",   RandomForestRegressor(n_estimators=200, max_depth=8,  random_state=seed, n_jobs=-1)),
-        ("RF_md12",  RandomForestRegressor(n_estimators=300, max_depth=12, random_state=seed, n_jobs=-1)),
-        ("RF_md16",  RandomForestRegressor(n_estimators=400, max_depth=16, random_state=seed, n_jobs=-1)),
+        ("RF_md4",   RandomForestRegressor(n_estimators=100, max_depth=4,  random_state=seed, n_jobs=4)),
+        ("RF_md8",   RandomForestRegressor(n_estimators=200, max_depth=8,  random_state=seed, n_jobs=4)),
+        ("RF_md12",  RandomForestRegressor(n_estimators=300, max_depth=12, random_state=seed, n_jobs=4)),
+        ("RF_md16",  RandomForestRegressor(n_estimators=400, max_depth=16, random_state=seed, n_jobs=4)),
 
         # Neural networks
         ("MLP_50_l2",       MLPRegressor(hidden_layer_sizes=(50,),       alpha=1e-2, max_iter=500, random_state=seed)),

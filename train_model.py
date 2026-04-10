@@ -147,14 +147,14 @@ def get_base_regressors(seed: int = 23) -> list:
     """
     return [
         # Linear regularised models
-        ("Lasso_a1e-3",    Lasso(alpha=1e-3, max_iter=5000, random_state=seed)),
-        ("Lasso_a1e-2",    Lasso(alpha=1e-2, max_iter=5000, random_state=seed)),
-        ("Lasso_a1e-1",    Lasso(alpha=1e-1, max_iter=5000, random_state=seed)),
+        ("Lasso_a1e-3",    Lasso(alpha=1e-3, max_iter=1000, random_state=seed)),
+        ("Lasso_a1e-2",    Lasso(alpha=1e-2, max_iter=1000, random_state=seed)),
+        ("Lasso_a1e-1",    Lasso(alpha=1e-1, max_iter=1000, random_state=seed)),
         ("Ridge_a1e-1",    Ridge(alpha=1e-1)),
         ("Ridge_a1",       Ridge(alpha=1.0)),
         ("Ridge_a10",      Ridge(alpha=10.0)),
-        ("ElasticNet_l1_05", ElasticNet(alpha=1e-2, l1_ratio=0.5, max_iter=5000, random_state=seed)),
-        ("ElasticNet_l1_08", ElasticNet(alpha=1e-2, l1_ratio=0.8, max_iter=5000, random_state=seed)),
+        ("ElasticNet_l1_05", ElasticNet(alpha=1e-2, l1_ratio=0.5, max_iter=1000, random_state=seed)),
+        ("ElasticNet_l1_08", ElasticNet(alpha=1e-2, l1_ratio=0.8, max_iter=1000, random_state=seed)),
 
         # Random Forest
         ("RF_md4",   RandomForestRegressor(n_estimators=100, max_depth=4,  random_state=seed, n_jobs=-1)),

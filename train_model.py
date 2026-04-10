@@ -304,6 +304,7 @@ def train_and_evaluate_ensemble(
             'test_mae': test_mae,
             'test_rmse': test_rmse,
         })
+        print(f'  - model: {name}, r2: {test_r2}')
 
     # Ensemble evaluation on test set (meta-learner trained on 20k OOF)
     oof_preds_20k = _build_oof_matrix(top_results, X_train, y_train, feature_sets, seed=seed)

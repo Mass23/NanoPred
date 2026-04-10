@@ -250,7 +250,8 @@ def train_and_evaluate_ensemble(
     for n_features in [5, 10, 20]:
         all_model_results.extend(
             evaluate_models_on_feature_set(
-                base_models, X_train, y_train, n_features, feature_sets, seed=seed
+                base_models, X_train, y_train, n_features, feature_sets,
+                seed=seed, n_repeats=3,
             )
         )
 

@@ -76,6 +76,33 @@ def load_and_prepare_data(csv_path: str) -> tuple:
 
 
 # =========================================================
+# FEATURE ENGINEERING
+# =========================================================
+
+def expand_features(X: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create log and sqrt versions of all numeric features.
+
+    For each original column `col`:
+      - log version (`col__log`):  np.log1p(x) — handles zeros automatically.
+      - sqrt version (`col__sqrt`): np.sqrt(np.abs(x)) * np.sign(x) — handles negatives.
+
+    Returns a new DataFrame with original + log + sqrt columns (3x feature count).
+    """
+    parts = [X]
+    for col in X.columns:
+        vals = X[col].values.astype(float)
+
+        log_vals = np.log1p(vals)
+        sqrt_vals = np.sqrt(np.abs(vals)) * np.sign(vals)
+
+        parts.append(pd.Series(log_vals,  index=X.index, name=f"{col}__log"))
+        parts.append(pd.Series(sqrt_vals, index=X.index, name=f"{col}__sqrt"))
+
+    return pd.concat(parts, axis=1)
+
+
+# =========================================================
 # FEATURE SELECTION
 # =========================================================
 

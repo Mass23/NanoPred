@@ -176,7 +176,7 @@ def get_base_regressors(seed: int = 23) -> list:
 
 
 # =========================================================
-# MODEL EVALUATION WITH K-FOLD CV
+# MODEL EVALUATION WITH RANDOM SUBSAMPLING
 # =========================================================
 
 def evaluate_models_on_feature_set(
@@ -187,38 +187,57 @@ def evaluate_models_on_feature_set(
     feature_sets: dict,
     seed: int = 23,
     n_repeats: int = 3,
+    subsample_size: int = 30_000,
+    subsample_train: int = 25_000,
 ) -> list:
     """
-    Evaluate all base models on a specific feature set using 3-fold CV repeated
-    n_repeats times (default 3) to obtain stable performance estimates.
+    Evaluate all base models on a specific feature set using n_repeats random
+    subsamples drawn from X_train.
+
+    Each repeat:
+      1. Draw subsample_size rows at random (without replacement, or all rows if
+         fewer are available).
+      2. Use the first subsample_train rows as a mini-train set and the
+         remainder as a mini-validation set.
+
+    This gives n_repeats R² scores per model whose mean is used for ranking.
 
     Returns:
         List of (name, model, n_features, mean_cv_r2) tuples.
     """
     features = feature_sets[n_features]
     X_sel = X_train[features]
+    n_available = len(X_sel)
+
+    # Clamp sample sizes to what is actually available
+    effective_sample = min(subsample_size, n_available)
+    effective_train  = min(subsample_train, effective_sample - 1)
 
     model_results = []
 
     print(f"  Evaluating base models for top {n_features} features "
-          f"({n_repeats} repeated splits):")
+          f"({n_repeats} random subsamples, "
+          f"train={effective_train:,} / val={effective_sample - effective_train:,}):")
     for name, model in base_models:
         scores = []
         for repeat in range(n_repeats):
-            kf = KFold(n_splits=3, shuffle=True, random_state=seed + repeat)
-            for tr_idx, val_idx in kf.split(X_sel):
-                X_tr  = X_sel.iloc[tr_idx]
-                X_val = X_sel.iloc[val_idx]
-                y_tr  = y_train.iloc[tr_idx]
-                y_val = y_train.iloc[val_idx]
+            rng = np.random.default_rng(seed + repeat)
+            sample_idx = rng.choice(n_available, size=effective_sample, replace=False)
+            tr_idx  = sample_idx[:effective_train]
+            val_idx = sample_idx[effective_train:]
 
-                m = clone(model)
-                m.fit(X_tr, y_tr)
-                y_pred = m.predict(X_val)
-                scores.append(r2_score(y_val, y_pred))
+            X_tr  = X_sel.iloc[tr_idx]
+            X_val = X_sel.iloc[val_idx]
+            y_tr  = y_train.iloc[tr_idx]
+            y_val = y_train.iloc[val_idx]
+
+            m = clone(model)
+            m.fit(X_tr, y_tr)
+            y_pred = m.predict(X_val)
+            scores.append(r2_score(y_val, y_pred))
 
         mean_r2 = float(np.mean(scores))
-        print(f"    {name:25s} CV R² = {mean_r2:.4f}")
+        print(f"    {name:25s} mean R² = {mean_r2:.4f}")
         model_results.append((name, model, n_features, mean_r2))
 
     return model_results
@@ -239,8 +258,9 @@ def train_and_evaluate_ensemble(
     seed: int = 23,
 ) -> dict:
     """
-    Train base models on all feature sets, select top-k by CV R², then combine
-    their predictions with a Ridge meta-learner (penalised regression ensemble).
+    Train base models on all feature sets, select top-k by mean R² from random
+    subsamples, then combine their predictions with a Ridge meta-learner
+    (penalised regression ensemble).
 
     Returns:
         dict with trained_models, meta_learner, ensemble_metadata, and metrics.
@@ -260,8 +280,8 @@ def train_and_evaluate_ensemble(
     top_results = sorted_results[:top_k]
 
     print(f"\n  Top {top_k} models selected:")
-    for name, _, n_feat, cv_r2 in top_results:
-        print(f"    {name:25s} (top {n_feat:2d} feats)  CV R² = {cv_r2:.4f}")
+    for name, _, n_feat, mean_r2 in top_results:
+        print(f"    {name:25s} (top {n_feat:2d} feats)  mean R² = {mean_r2:.4f}")
 
     # ----- Step 3: train top-k models on FULL training set -----
     # Also collect out-of-fold predictions for meta-learner training
@@ -431,8 +451,8 @@ def main() -> None:
     parser.add_argument(
         '--test-fraction',
         type=float,
-        default=0.2,
-        help='Fraction of data to hold out for testing (default: 0.2).',
+        default=0.1,
+        help='Fraction of data to hold out for testing (default: 0.1).',
     )
     parser.add_argument(
         '--top-k',
@@ -541,7 +561,7 @@ def main() -> None:
     print("=" * 70)
 
     print("\nPer-model test performance:")
-    print(f"  {'Model':<25}  {'Feats':>5}  {'CV R²':>8}  {'Test R²':>8}  "
+    print(f"  {'Model':<25}  {'Feats':>5}  {'mean R²':>8}  {'Test R²':>8}  "
           f"{'MAE':>8}  {'RMSE':>8}")
     print("  " + "-" * 72)
     for row in result['test_results_per_model']:

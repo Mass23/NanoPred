@@ -47,8 +47,8 @@ def load_and_prepare_data(csv_path: str) -> tuple:
 
     # Length filtering
     before = len(df)
-    df = df[(df['length_min'] >= 900) & (df['length_max'] <= 2500)]
-    print(f"  After length filter (900–2500 bp): {len(df):,} rows "
+    df = df[(df['length_min'] >= 900) & (df['length_max'] <= 3000)]
+    print(f"  After length filter (900–3000 bp): {len(df):,} rows "
           f"(removed {before - len(df):,}).")
 
     # Drop missing values

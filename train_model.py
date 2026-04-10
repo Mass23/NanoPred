@@ -157,10 +157,10 @@ def get_base_regressors(seed: int = 23) -> list:
         ("ElasticNet_l1_08", ElasticNet(alpha=1e-2, l1_ratio=0.8, max_iter=5000, random_state=seed)),
 
         # Random Forest
-        ("RF_md4",   RandomForestRegressor(n_estimators=100, max_depth=4,  random_state=seed, n_jobs=-1)),
-        ("RF_md8",   RandomForestRegressor(n_estimators=200, max_depth=8,  random_state=seed, n_jobs=-1)),
-        ("RF_md12",  RandomForestRegressor(n_estimators=300, max_depth=12, random_state=seed, n_jobs=-1)),
-        ("RF_md16",  RandomForestRegressor(n_estimators=400, max_depth=16, random_state=seed, n_jobs=-1)),
+        ("RF_md4",   RandomForestRegressor(n_estimators=100, max_depth=4,  random_state=seed, n_jobs=4)),
+        ("RF_md8",   RandomForestRegressor(n_estimators=200, max_depth=8,  random_state=seed, n_jobs=4)),
+        ("RF_md12",  RandomForestRegressor(n_estimators=300, max_depth=12, random_state=seed, n_jobs=4)),
+        ("RF_md16",  RandomForestRegressor(n_estimators=400, max_depth=16, random_state=seed, n_jobs=4)),
 
         # Neural networks
         ("MLP_50_l2",       MLPRegressor(hidden_layer_sizes=(50,),       alpha=1e-2, max_iter=500, random_state=seed)),
@@ -231,7 +231,7 @@ def train_and_evaluate_ensemble(
     y_test: pd.Series,
     feature_sets: dict,
     base_models: list,
-    top_k: int = 5,
+    top_k: int = 10,
     seed: int = 23,
 ) -> dict:
     """
@@ -243,7 +243,7 @@ def train_and_evaluate_ensemble(
     """
     # ----- Step 1: evaluate all base models on each feature set -----
     all_model_results = []
-    for n_features in [10, 20, 30]:
+    for n_features in [5, 10, 20]:
         all_model_results.extend(
             evaluate_models_on_feature_set(
                 base_models, X_train, y_train, n_features, feature_sets, seed=seed
@@ -359,8 +359,9 @@ def save_models(output_dir: str, result: dict) -> None:
         joblib.dump(feats,  feats_path)
 
     # Save meta-learner
-    joblib.dump(result['meta_learner'], os.path.join(output_dir, 'meta_learner.pkl'))
-    joblib.dump(result['meta_scaler'],  os.path.join(output_dir, 'meta_scaler.pkl'))
+    joblib.dump(result['meta_learner'],   os.path.join(output_dir, 'meta_learner.pkl'))
+    joblib.dump(result['meta_scaler'],    os.path.join(output_dir, 'meta_scaler.pkl'))
+    joblib.dump(result['feature_scaler'], os.path.join(output_dir, 'feature_scaler.pkl'))
 
     # Save ensemble metadata
     ensemble_metadata = {
@@ -427,8 +428,8 @@ def main() -> None:
     parser.add_argument(
         '--top-k',
         type=int,
-        default=5,
-        help='Number of top base models to include in the ensemble (default: 5).',
+        default=10,
+        help='Number of top base models to include in the ensemble (default: 10).',
     )
     parser.add_argument(
         '--seed',
@@ -467,41 +468,66 @@ def main() -> None:
     print(f"  Train: {len(X_train):,} rows   Test: {len(X_test):,} rows")
 
     # ------------------------------------------------------------------
-    # 3. Feature selection (Spearman correlation on training set)
+    # 3. Feature expansion: create log and sqrt versions of all features
     # ------------------------------------------------------------------
-    print("\n3. Selecting features via Spearman correlation...")
+    print("\n3. Expanding features (log + sqrt transformations)...")
+    X_train_exp = expand_features(X_train)
+    X_test_exp  = expand_features(X_test)
+    print(f"  Features after expansion: {X_train_exp.shape[1]} "
+          f"({X_train.shape[1]} original × 3)")
+
+    # ------------------------------------------------------------------
+    # 4. Standardize (fit on training set only, apply to both)
+    # ------------------------------------------------------------------
+    print("\n4. Standardizing features (fit on train only)...")
+    feature_scaler = StandardScaler()
+    X_train_scaled_arr = feature_scaler.fit_transform(X_train_exp)
+    X_test_scaled_arr  = feature_scaler.transform(X_test_exp)
+
+    X_train_scaled = pd.DataFrame(
+        X_train_scaled_arr, columns=X_train_exp.columns, index=X_train_exp.index
+    )
+    X_test_scaled = pd.DataFrame(
+        X_test_scaled_arr, columns=X_test_exp.columns, index=X_test_exp.index
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Feature selection (Spearman correlation on scaled training set)
+    # ------------------------------------------------------------------
+    print("\n5. Selecting features via Spearman correlation (train only)...")
     feature_sets = {}
-    for n_feat in [10, 20, 30]:
-        feature_sets[n_feat] = select_topn_spearman(X_train, y_train, n_feat)
+    for n_feat in [5, 10, 20]:
+        feature_sets[n_feat] = select_topn_spearman(X_train_scaled, y_train, n_feat)
         print(f"  Top {n_feat}: {feature_sets[n_feat]}")
 
     # ------------------------------------------------------------------
-    # 4. Define base regressors
+    # 6. Define base regressors
     # ------------------------------------------------------------------
-    print("\n4. Defining base regressors...")
+    print("\n6. Defining base regressors...")
     base_models = get_base_regressors(seed=args.seed)
     print(f"  {len(base_models)} base models defined.")
 
     # ------------------------------------------------------------------
-    # 5. Train and evaluate
+    # 7. Train and evaluate
     # ------------------------------------------------------------------
-    print("\n5. Evaluating base models and training ensemble...")
+    print("\n7. Evaluating base models and training ensemble...")
     result = train_and_evaluate_ensemble(
-        X_train, y_train, X_test, y_test,
+        X_train_scaled, y_train, X_test_scaled, y_test,
         feature_sets, base_models,
         top_k=args.top_k,
         seed=args.seed,
     )
+    result['feature_scaler'] = feature_scaler
 
     # ------------------------------------------------------------------
-    # 6. Save models and results
+    # 8. Save models and results
     # ------------------------------------------------------------------
-    print("\n6. Saving models and results...")
+    print("\n8. Saving models and results...")
     save_models(args.output_dir, result)
     save_results(args.results, result)
 
     # ------------------------------------------------------------------
-    # 7. Summary
+    # 9. Summary
     # ------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("SUMMARY")

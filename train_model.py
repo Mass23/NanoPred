@@ -106,7 +106,7 @@ def expand_features(X: pd.DataFrame) -> pd.DataFrame:
 # FEATURE SELECTION
 # =========================================================
 
-def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int) -> list:
+def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -> list:
     """
     Select the top-n features using a combined ranking of three metrics:
       1. |Spearman correlation| with target
@@ -124,6 +124,7 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int) -> list:
         X: Feature DataFrame (training data only).
         y: Target Series (training data only).
         n: Number of features to select.
+        seed: Random seed for the RandomForest (default: 0).
 
     Returns:
         List of column names (top n by lowest average rank).
@@ -144,7 +145,7 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int) -> list:
             spearman_scores.append(abs(r_sp) if not np.isnan(r_sp) else 0.0)
             pearson_scores.append(abs(r_pe) if not np.isnan(r_pe) else 0.0)
 
-    rf = RandomForestRegressor(n_estimators=100, random_state=0, n_jobs=-1)
+    rf = RandomForestRegressor(n_estimators=100, random_state=seed, n_jobs=-1)
     rf.fit(X, y_vals)
     rf_scores = list(rf.feature_importances_)
 
@@ -557,7 +558,7 @@ def main() -> None:
     print("\n3. Selecting features via combined ranking (Spearman + Pearson + RF importance)...")
     feature_sets = {}
     for n_feat in [3, 7, 14, 21]:
-        feature_sets[n_feat] = select_topn_combined(X_train_scaled, y_train, n_feat)
+        feature_sets[n_feat] = select_topn_combined(X_train_scaled, y_train, n_feat, seed=args.seed)
         print(f"  Top {n_feat}: {feature_sets[n_feat]}")
 
     # ------------------------------------------------------------------

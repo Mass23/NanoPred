@@ -197,24 +197,74 @@ def evaluate_models_on_feature_set(
 # ENSEMBLE TRAINING AND EVALUATION
 # =========================================================
 
+def _build_oof_matrix(
+    top_results: list,
+    X: pd.DataFrame,
+    y: pd.Series,
+    feature_sets: dict,
+    n_splits: int = 3,
+    seed: int = 23,
+) -> np.ndarray:
+    """
+    Build an out-of-fold prediction matrix for the given models and dataset.
+
+    Args:
+        top_results: List of (name, model, n_feat, cv_r2) tuples.
+        X: Feature DataFrame.
+        y: Target Series.
+        feature_sets: Dict mapping n_features -> list of column names.
+        n_splits: Number of KFold splits.
+        seed: Random seed.
+
+    Returns:
+        oof_preds: Array of shape (len(X), len(top_results)).
+    """
+    top_k = len(top_results)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    oof_preds = np.zeros((len(X), top_k))
+    for tr_idx, val_idx in kf.split(X):
+        for m_idx, (name, model, n_feat, _) in enumerate(top_results):
+            feats = feature_sets[n_feat]
+            m = clone(model)
+            m.fit(X.iloc[tr_idx][feats], y.iloc[tr_idx])
+            oof_preds[val_idx, m_idx] = m.predict(X.iloc[val_idx][feats])
+    return oof_preds
+
+
 def train_and_evaluate_ensemble(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_test: pd.DataFrame,
     y_test: pd.Series,
+    X_full: pd.DataFrame,
+    y_full: pd.Series,
     feature_sets: dict,
     base_models: list,
     top_k: int = 5,
     seed: int = 23,
 ) -> dict:
     """
-    Train base models on all feature sets, select top-k by CV R², then combine
-    their predictions with a Ridge meta-learner (penalised regression ensemble).
+    Stage 1: Evaluate base models on 20k train / 10k test, select top-k by CV R².
+    Stage 3: Retrain top-k on the entire filtered dataset and combine with a
+             Ridge meta-learner trained on out-of-fold predictions from the
+             full dataset.
+
+    Args:
+        X_train: 20k training features for base model comparison.
+        y_train: 20k training target.
+        X_test:  10k held-out test features for evaluation.
+        y_test:  10k held-out test target.
+        X_full:  Entire filtered dataset features (for final retraining).
+        y_full:  Entire filtered dataset target.
+        feature_sets: Dict mapping n_features -> list of column names.
+        base_models:  List of (name, model) tuples.
+        top_k:  Number of top base models to include in the ensemble.
+        seed:   Random seed.
 
     Returns:
         dict with trained_models, meta_learner, ensemble_metadata, and metrics.
     """
-    # ----- Step 1: evaluate all base models on each feature set -----
+    # ----- Stage 1a: evaluate all base models on each feature set via CV -----
     all_model_results = []
     for n_features in [10, 20, 30]:
         all_model_results.extend(
@@ -223,7 +273,7 @@ def train_and_evaluate_ensemble(
             )
         )
 
-    # ----- Step 2: select top-k models -----
+    # ----- Stage 1b: select top-k models by CV R² -----
     sorted_results = sorted(all_model_results, key=lambda x: x[3], reverse=True)
     top_results = sorted_results[:top_k]
 
@@ -231,46 +281,20 @@ def train_and_evaluate_ensemble(
     for name, _, n_feat, cv_r2 in top_results:
         print(f"    {name:25s} (top {n_feat:2d} feats)  CV R² = {cv_r2:.4f}")
 
-    # ----- Step 3: train top-k models on FULL training set -----
-    # Also collect out-of-fold predictions for meta-learner training
-    kf = KFold(n_splits=3, shuffle=True, random_state=seed)
-
-    # Build OOF matrix: rows = train samples, cols = top-k base models
-    oof_preds = np.zeros((len(X_train), top_k))
-    for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(X_train)):
-        for m_idx, (name, model, n_feat, _) in enumerate(top_results):
-            feats = feature_sets[n_feat]
-            X_tr  = X_train.iloc[tr_idx][feats]
-            X_val = X_train.iloc[val_idx][feats]
-            y_tr  = y_train.iloc[tr_idx]
-
-            m = clone(model)
-            m.fit(X_tr, y_tr)
-            oof_preds[val_idx, m_idx] = m.predict(X_val)
-
-    # Train meta-learner on OOF predictions
-    meta_scaler = StandardScaler()
-    oof_scaled = meta_scaler.fit_transform(oof_preds)
-    meta_learner = Ridge(alpha=1.0)
-    meta_learner.fit(oof_scaled, y_train)
-
-    # Train final base models on full training set
-    trained_models = []
-    test_base_preds = np.zeros((len(X_test), top_k))
+    # ----- Stage 1c: train top-k on 20k set, evaluate individually on 10k -----
+    test_base_preds_20k = np.zeros((len(X_test), top_k))
     test_results_per_model = []
 
     for m_idx, (name, model, n_feat, cv_r2) in enumerate(top_results):
         feats = feature_sets[n_feat]
         m = clone(model)
         m.fit(X_train[feats], y_train)
-        trained_models.append((name, m, n_feat, feats))
 
-        # Individual test-set evaluation
         y_test_pred = m.predict(X_test[feats])
-        test_base_preds[:, m_idx] = y_test_pred
+        test_base_preds_20k[:, m_idx] = y_test_pred
 
-        test_r2  = r2_score(y_test, y_test_pred)
-        test_mae = mean_absolute_error(y_test, y_test_pred)
+        test_r2   = r2_score(y_test, y_test_pred)
+        test_mae  = mean_absolute_error(y_test, y_test_pred)
         test_rmse = float(np.sqrt(mean_squared_error(y_test, y_test_pred)))
         test_results_per_model.append({
             'model_name': name,
@@ -281,18 +305,46 @@ def train_and_evaluate_ensemble(
             'test_rmse': test_rmse,
         })
 
-    # ----- Step 4: ensemble prediction -----
-    test_base_scaled = meta_scaler.transform(test_base_preds)
-    y_ensemble = meta_learner.predict(test_base_scaled)
+    # Ensemble evaluation on test set (meta-learner trained on 20k OOF)
+    oof_preds_20k = _build_oof_matrix(top_results, X_train, y_train, feature_sets, seed=seed)
 
-    ensemble_r2   = r2_score(y_test, y_ensemble)
-    ensemble_mae  = mean_absolute_error(y_test, y_ensemble)
-    ensemble_rmse = float(np.sqrt(mean_squared_error(y_test, y_ensemble)))
+    eval_scaler = StandardScaler()
+    oof_scaled_20k = eval_scaler.fit_transform(oof_preds_20k)
+    eval_meta = Ridge(alpha=1.0)
+    eval_meta.fit(oof_scaled_20k, y_train)
 
-    print(f"\n  Ensemble (Ridge meta-learner):")
+    test_base_scaled_20k = eval_scaler.transform(test_base_preds_20k)
+    y_ensemble_test = eval_meta.predict(test_base_scaled_20k)
+
+    ensemble_r2   = r2_score(y_test, y_ensemble_test)
+    ensemble_mae  = mean_absolute_error(y_test, y_ensemble_test)
+    ensemble_rmse = float(np.sqrt(mean_squared_error(y_test, y_ensemble_test)))
+
+    print(f"\n  Ensemble (Ridge meta-learner, evaluated on 10k test set):")
     print(f"    R²   = {ensemble_r2:.4f}")
     print(f"    MAE  = {ensemble_mae:.4f}")
     print(f"    RMSE = {ensemble_rmse:.4f}")
+
+    # ----- Stage 3: retrain top-k models on the ENTIRE filtered dataset -----
+    print(f"\n  Retraining top {top_k} models on entire filtered dataset "
+          f"({len(X_full):,} rows)...")
+
+    oof_preds_full = _build_oof_matrix(top_results, X_full, y_full, feature_sets, seed=seed)
+
+    # Train the final meta-learner on OOF predictions from the full dataset
+    meta_scaler = StandardScaler()
+    oof_scaled_full = meta_scaler.fit_transform(oof_preds_full)
+    meta_learner = Ridge(alpha=1.0)
+    meta_learner.fit(oof_scaled_full, y_full)
+
+    # Fit the final base models on the complete filtered dataset
+    trained_models = []
+    for name, model, n_feat, cv_r2 in top_results:
+        feats = feature_sets[n_feat]
+        m = clone(model)
+        m.fit(X_full[feats], y_full)
+        trained_models.append((name, m, n_feat, feats))
+        print(f"    ✓ {name} retrained on full data (top {n_feat} feats)")
 
     return {
         'trained_models': trained_models,
@@ -393,10 +445,16 @@ def main() -> None:
         help='Path to save results CSV (default: results.csv).',
     )
     parser.add_argument(
-        '--test-fraction',
-        type=float,
-        default=0.2,
-        help='Fraction of data to hold out for testing (default: 0.2).',
+        '--train-size',
+        type=int,
+        default=20000,
+        help='Number of samples to use for base model training (default: 20000).',
+    )
+    parser.add_argument(
+        '--test-size',
+        type=int,
+        default=10000,
+        help='Number of samples to hold out for base model evaluation (default: 10000).',
     )
     parser.add_argument(
         '--top-k',
@@ -423,22 +481,28 @@ def main() -> None:
     X, y = load_and_prepare_data(args.input)
 
     # ------------------------------------------------------------------
-    # 2. Train / test split
+    # 2. Train / test split (fixed 20k train, 10k test)
     # ------------------------------------------------------------------
     print("\n2. Splitting into train/test sets...")
     rng = np.random.default_rng(args.seed)
     n = len(X)
-    test_size = int(n * args.test_fraction)
+    need = args.train_size + args.test_size
+    if n < need:
+        raise ValueError(
+            f"Not enough data after filtering: {n:,} rows available, "
+            f"need at least {need:,} ({args.train_size:,} train + {args.test_size:,} test)."
+        )
     all_idx = rng.permutation(n)
-    test_idx  = all_idx[:test_size]
-    train_idx = all_idx[test_size:]
+    train_idx = all_idx[:args.train_size]
+    test_idx  = all_idx[args.train_size:args.train_size + args.test_size]
 
     X_train = X.iloc[train_idx].reset_index(drop=True)
     X_test  = X.iloc[test_idx].reset_index(drop=True)
     y_train = y.iloc[train_idx].reset_index(drop=True)
     y_test  = y.iloc[test_idx].reset_index(drop=True)
 
-    print(f"  Train: {len(X_train):,} rows   Test: {len(X_test):,} rows")
+    print(f"  Train: {len(X_train):,} rows   Test: {len(X_test):,} rows   "
+          f"Full (for final ensemble): {n:,} rows")
 
     # ------------------------------------------------------------------
     # 3. Feature selection (Spearman correlation on training set)
@@ -462,6 +526,7 @@ def main() -> None:
     print("\n5. Evaluating base models and training ensemble...")
     result = train_and_evaluate_ensemble(
         X_train, y_train, X_test, y_test,
+        X, y,           # full filtered dataset – used for final retraining
         feature_sets, base_models,
         top_k=args.top_k,
         seed=args.seed,

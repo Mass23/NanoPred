@@ -296,67 +296,72 @@ def quality_hash(quality_scores: list, num_bits: int) -> np.ndarray:
 
 _BASE_TO_INT = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 
-def _kmer_to_index(kmer: str) -> int:
-    """Map a DNA k-mer (ACGT only) to a base-4 integer index in [0, 4^k)."""
-    idx = 0
-    for ch in kmer:
-        v = _BASE_TO_INT.get(ch)
-        if v is None:
-            return -1
-        idx = (idx * 4) + v
-    return idx
-
-def _explicit_kmer_presence_indices(seq: str, k: int) -> set:
+def _kmer_set_indices(seq: str, k: int) -> np.ndarray:
     """
-    Build an explicit fixed-vocabulary k-mer spectrum (presence only).
-    Returns a set of k-mer indices (base-4 encoded) present in the sequence.
-    Any k-mer containing non-ACGT is skipped.
+    Return the sorted unique indices (base-4 encoding) of all A/C/G/T k-mers
+    present in seq. This is an explicit fixed-vocabulary representation that
+    is comparable across sequences without storing 4^k vectors.
     """
     seq = seq.upper()
     if len(seq) < k:
-        return set()
+        return np.array([], dtype=np.uint32)
 
     present = set()
-    # simple windowing; skip kmers with non-ACGT
     for i in range(len(seq) - k + 1):
-        idx = _kmer_to_index(seq[i:i+k])
-        if idx >= 0:
+        idx = 0
+        ok = True
+        for ch in seq[i:i+k]:
+            v = _BASE_TO_INT.get(ch)
+            if v is None:
+                ok = False
+                break
+            idx = (idx * 4) + v
+        if ok:
             present.add(idx)
-    return present
 
-def _hash_indices_to_bitset(indices: set, num_bits: int, num_seeds: int = 4) -> np.ndarray:
+    if not present:
+        return np.array([], dtype=np.uint32)
+
+    return np.array(sorted(present), dtype=np.uint32)
+
+def _minhash_signature_from_indices(indices: np.ndarray, num_perm: int) -> np.ndarray:
     """
-    Convert a set of explicit spectrum indices into a compact bitset sketch.
-
-    For each index i, set multiple bits using seeded SHA-256:
-      bit = sha256(seed || i) % num_bits
-    This preserves the property that the same k-mer index always contributes to
-    the same bit positions for a given seed (comparable across sequences).
+    Compute MinHash signature of length num_perm for a set of integer indices.
+    Uses SHA-256(seed || index) as the hash function family. Deterministic.
+    Returns uint64 array of length num_perm.
     """
-    if not indices:
-        return np.zeros(num_bits, dtype=np.uint8)
+    if indices.size == 0:
+        # empty set: signature of max values so similarity with empty behaves sensibly
+        return np.full(num_perm, np.iinfo(np.uint64).max, dtype=np.uint64)
 
-    bits = np.zeros(num_bits, dtype=np.uint8)
-    for i in indices:
-        i_bytes = int(i).to_bytes(8, 'big', signed=False)
-        for seed in range(num_seeds):
-            h = hashlib.sha256(seed.to_bytes(4, 'big') + i_bytes).digest()
-            pos = int.from_bytes(h[:8], 'big') % num_bits
-            bits[pos] = 1
-    return bits
+    sig = np.full(num_perm, np.iinfo(np.uint64).max, dtype=np.uint64)
+    # Iterate the set; update mins
+    for idx in indices:
+        idx_bytes = int(idx).to_bytes(8, "big", signed=False)
+        for seed in range(num_perm):
+            h = hashlib.sha256(seed.to_bytes(4, "big") + idx_bytes).digest()
+            hv = int.from_bytes(h[:8], "big", signed=False)  # 64-bit hash value
+            if hv < sig[seed]:
+                sig[seed] = hv
+    return sig
+
+def minhash_jaccard(sig1: np.ndarray, sig2: np.ndarray) -> float:
+    """
+    Estimate Jaccard similarity from two MinHash signatures:
+    J(A,B) ≈ fraction of positions where sig1 == sig2.
+    """
+    if sig1.shape != sig2.shape or sig1.size == 0:
+        return 0.0
+    return float(np.mean(sig1 == sig2))
 
 def kmer_hash(seq: str, k: int, num_bits: int) -> np.ndarray:
     """
-    Build a fixed-vocabulary (explicit) k-mer spectrum (presence) and then hash
-    it into a compact bitset of length num_bits.
-
-    This makes comparisons meaningful across sequences because each k-mer maps
-    to a stable spectrum index first (base-4 encoding), then to stable hashed
-    bit positions (seeded SHA-256).
+    Produce a MinHash signature (length = num_bits) for the explicit set of k-mers.
+    Note: num_bits here is really 'num_perm' (64/128/256), kept for compatibility
+    with existing column naming.
     """
-    indices = _explicit_kmer_presence_indices(seq, k)
-    return _hash_indices_to_bitset(indices, num_bits=num_bits, num_seeds=4)
-
+    indices = _kmer_set_indices(seq, k)
+    return _minhash_signature_from_indices(indices, num_perm=num_bits)
 
 # ---------------------------------------------------------------------------
 # Metrics computation
@@ -454,20 +459,21 @@ def compute_pair_features(m1: dict, m2: dict) -> dict:
 
     # Jaccard comparisons for hash metrics
     hash_groups = [
-        ('dna_binary', 'dna_binary_hash'),
-        ('quality', 'quality_hash'),
-        ('kmer_3', 'kmer_3_hash'),
-        ('kmer_5', 'kmer_5_hash'),
-        ('kmer_7', 'kmer_7_hash'),
+        ('dna_binary', 'dna_binary_hash', 'bit'),
+        ('quality', 'quality_hash', 'bit'),
+        ('kmer_3', 'kmer_3_hash', 'minhash'),
+        ('kmer_5', 'kmer_5_hash', 'minhash'),
+        ('kmer_7', 'kmer_7_hash', 'minhash'),
     ]
-    for label, key_prefix in hash_groups:
+    for label, key_prefix, kind in hash_groups:
         for bits in (64, 128, 256):
             col = f'{label}_jaccard_{bits}'
-            features[col] = jaccard_similarity(
-                m1[f'{key_prefix}_{bits}'],
-                m2[f'{key_prefix}_{bits}']
-            )
-
+            a = m1[f'{key_prefix}_{bits}']
+            b = m2[f'{key_prefix}_{bits}']
+            if kind == 'minhash':
+                features[col] = minhash_jaccard(a, b)
+            else:
+                features[col] = jaccard_similarity(a, b)
     return features
 
 

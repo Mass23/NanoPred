@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import os
+import warnings
 
 import joblib
 import numpy as np
@@ -108,7 +109,7 @@ def expand_features(X: pd.DataFrame) -> pd.DataFrame:
 
 # Minimum number of features guaranteed per group (prefix).
 # Total quota = 7, matching the smallest evaluated feature-set size.
-GROUP_QUOTAS: dict = {
+GROUP_QUOTAS: dict[str, int] = {
     "length":  1,
     "gc":      1,
     "dna":     1,
@@ -184,10 +185,11 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
     ranked_cols = sorted(zip(cols, avg_rank), key=lambda x: x[1])
 
     # Step 1: enforce group quotas
-    selected: list = []
-    selected_set: set = set()
+    selected: list[str] = []
+    selected_set: set[str] = set()
     for prefix, quota in GROUP_QUOTAS.items():
-        group = [(col, rank) for col, rank in ranked_cols if col.startswith(prefix + "_")]
+        pref = f"{prefix}_"
+        group = [(col, rank) for col, rank in ranked_cols if col.startswith(pref)]
         taken = 0
         for col, _ in group:
             if taken >= quota:
@@ -196,7 +198,11 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
             selected_set.add(col)
             taken += 1
         if taken < quota:
-            print(f"  Warning: group '{prefix}' has only {taken} feature(s), quota was {quota}.")
+            warnings.warn(
+                f"Group '{prefix}' has only {taken} feature(s), quota was {quota}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     # Step 2: fill remaining slots from global ranking (excluding already selected)
     for col, _ in ranked_cols:

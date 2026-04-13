@@ -395,9 +395,12 @@ def compute_metrics(seq: str, quality_scores: list) -> dict:
     gc = seq.count('G') + seq.count('C')
     metrics['gc_content'] = (gc / len(seq) * 100.0) if seq else 0.0
 
-    # Hash bit arrays (stored as np.ndarray, used only internally for Jaccard)
-    for k in (3, 4, 5):
-        metrics[f'kmer_{k}_hash_{bits}'] = kmer_hash(seq, k, bits)
+    for bits in (64, 128, 256):
+        metrics[f'dna_binary_hash_{bits}'] = dna_binary_hash(seq, bits)
+        metrics[f'quality_hash_{bits}'] = quality_hash(quality_scores, bits)
+
+        for k in (3, 4, 5):
+            metrics[f'kmer_{k}_hash_{bits}'] = kmer_hash(seq, k, bits)
 
     return metrics
 

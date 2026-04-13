@@ -319,12 +319,13 @@ def _kmer_set_indices(seq: str, k: int) -> np.ndarray:
     return np.fromiter(present, dtype=np.uint32)
 
 def _splitmix64(x: np.uint64) -> np.uint64:
-    """Fast 64-bit mixing (SplitMix64). Deterministic, good distribution."""
-    x = (x + np.uint64(0x9E3779B97F4A7C15)) & np.uint64(0xFFFFFFFFFFFFFFFF)
-    z = x
-    z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9) & np.uint64(0xFFFFFFFFFFFFFFFF)
-    z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB) & np.uint64(0xFFFFFFFFFFFFFFFF)
-    return z ^ (z >> np.uint64(31))
+    """Fast 64-bit mixing (SplitMix64). Wraparound overflow is intentional."""
+    with np.errstate(over='ignore'):
+        x = (x + np.uint64(0x9E3779B97F4A7C15)) & np.uint64(0xFFFFFFFFFFFFFFFF)
+        z = x
+        z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9) & np.uint64(0xFFFFFFFFFFFFFFFF)
+        z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB) & np.uint64(0xFFFFFFFFFFFFFFFF)
+        return z ^ (z >> np.uint64(31))
 
 def _indices_to_bitset(indices: np.ndarray, num_bits: int, num_hashes: int = 2) -> np.ndarray:
     """

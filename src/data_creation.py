@@ -296,11 +296,19 @@ def quality_hash(quality_scores: list, num_bits: int) -> np.ndarray:
 
 _BASE_TO_INT = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 
+# Pre-generated (deterministic) coefficients for fast MinHash
+# Using numpy RNG with a fixed seed for reproducibility across runs.
+# We generate up to 256 so existing code can still request 64/128/256.
+_MINHASH_MAX_PERM = 256
+_rng_mh = np.random.default_rng(12345)
+# Ensure 'a' is odd to improve mixing in mod 2^64 arithmetic
+_MINHASH_A = (_rng_mh.integers(1, np.iinfo(np.uint64).max, size=_MINHASH_MAX_PERM, dtype=np.uint64) | np.uint64(1))
+_MINHASH_B = _rng_mh.integers(0, np.iinfo(np.uint64).max, size=_MINHASH_MAX_PERM, dtype=np.uint64)
+
 def _kmer_set_indices(seq: str, k: int) -> np.ndarray:
     """
-    Return the sorted unique indices (base-4 encoding) of all A/C/G/T k-mers
-    present in seq. This is an explicit fixed-vocabulary representation that
-    is comparable across sequences without storing 4^k vectors.
+    Return unique indices (base-4 encoding) of all A/C/G/T k-mers present in seq.
+    Comparable across sequences without storing a 4^k dense vector.
     """
     seq = seq.upper()
     if len(seq) < k:
@@ -322,43 +330,41 @@ def _kmer_set_indices(seq: str, k: int) -> np.ndarray:
     if not present:
         return np.array([], dtype=np.uint32)
 
-    return np.array(sorted(present), dtype=np.uint32)
+    return np.fromiter(present, dtype=np.uint32)
 
 def _minhash_signature_from_indices(indices: np.ndarray, num_perm: int) -> np.ndarray:
     """
-    Compute MinHash signature of length num_perm for a set of integer indices.
-    Uses SHA-256(seed || index) as the hash function family. Deterministic.
-    Returns uint64 array of length num_perm.
+    Fast MinHash signature for a set of integer indices using arithmetic hashing:
+      h_i(x) = (a_i * x + b_i) mod 2^64
+    Returns uint64 array length num_perm.
     """
+    if num_perm > _MINHASH_MAX_PERM:
+        raise ValueError(f"num_perm={num_perm} exceeds max {_MINHASH_MAX_PERM}")
+
     if indices.size == 0:
-        # empty set: signature of max values so similarity with empty behaves sensibly
         return np.full(num_perm, np.iinfo(np.uint64).max, dtype=np.uint64)
 
-    sig = np.full(num_perm, np.iinfo(np.uint64).max, dtype=np.uint64)
-    # Iterate the set; update mins
-    for idx in indices:
-        idx_bytes = int(idx).to_bytes(8, "big", signed=False)
-        for seed in range(num_perm):
-            h = hashlib.sha256(seed.to_bytes(4, "big") + idx_bytes).digest()
-            hv = int.from_bytes(h[:8], "big", signed=False)  # 64-bit hash value
-            if hv < sig[seed]:
-                sig[seed] = hv
+    x = indices.astype(np.uint64)  # shape (m,)
+    a = _MINHASH_A[:num_perm]      # shape (num_perm,)
+    b = _MINHASH_B[:num_perm]      # shape (num_perm,)
+
+    # Compute hashes for all perms and all elements:
+    # H has shape (num_perm, m). Then signature is min across m for each perm.
+    # This is vectorized; much faster than per-seed SHA.
+    H = (a[:, None] * x[None, :] + b[:, None]).astype(np.uint64)
+    sig = H.min(axis=1)
     return sig
 
 def minhash_jaccard(sig1: np.ndarray, sig2: np.ndarray) -> float:
-    """
-    Estimate Jaccard similarity from two MinHash signatures:
-    J(A,B) ≈ fraction of positions where sig1 == sig2.
-    """
+    """Jaccard estimate from MinHash signatures."""
     if sig1.shape != sig2.shape or sig1.size == 0:
         return 0.0
     return float(np.mean(sig1 == sig2))
 
 def kmer_hash(seq: str, k: int, num_bits: int) -> np.ndarray:
     """
-    Produce a MinHash signature (length = num_bits) for the explicit set of k-mers.
-    Note: num_bits here is really 'num_perm' (64/128/256), kept for compatibility
-    with existing column naming.
+    Return MinHash signature length=num_bits for the explicit k-mer set.
+    'num_bits' kept for compatibility with existing naming (64/128/256).
     """
     indices = _kmer_set_indices(seq, k)
     return _minhash_signature_from_indices(indices, num_perm=num_bits)

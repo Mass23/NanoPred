@@ -1,5 +1,8 @@
 __pycache__/
 data/
+models_v01
+models_v02
+models_v03
 *.py[cod]
 *.pyo
 *.pyd

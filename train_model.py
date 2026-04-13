@@ -113,27 +113,22 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
       2. |Pearson correlation| with target
       3. RandomForest feature importance (trained on X, y)
 
-    Each metric is converted to a rank (rank 1 = best score).  The average
-    rank across the three metrics is computed per feature; features with the
-    lowest average rank are selected.
+    NEW: Enforce group quotas by prefix:
+      - length: 1
+      - gc: 1
+      - dna: 1
+      - quality: 2
+      - kmer: 2
+    (Total = 7). For n > 7, fill remaining slots by best overall combined rank.
 
     All computations use only the data passed in (no leakage when called on
     training data exclusively).
-
-    Args:
-        X: Feature DataFrame (training data only).
-        y: Target Series (training data only).
-        n: Number of features to select.
-        seed: Random seed for the RandomForest (default: 0).
-
-    Returns:
-        List of column names (top n by lowest average rank).
     """
     cols = X.columns.tolist()
     y_vals = y.values
 
     spearman_scores = []
-    pearson_scores  = []
+    pearson_scores = []
     for col in cols:
         vals = X[col].values
         if np.std(vals) == 0:
@@ -152,7 +147,7 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
     def to_rank(scores: list) -> np.ndarray:
         """Rank scores so that the highest score gets rank 1."""
         arr = np.array(scores, dtype=float)
-        order = np.argsort(-arr)      # descending sort → best first
+        order = np.argsort(-arr)  # descending sort → best first
         ranks = np.empty_like(order)
         ranks[order] = np.arange(1, len(arr) + 1)
         return ranks
@@ -160,11 +155,47 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
     ranks_sp = to_rank(spearman_scores)
     ranks_pe = to_rank(pearson_scores)
     ranks_rf = to_rank(rf_scores)
-    avg_rank  = (ranks_sp + ranks_pe + ranks_rf) / 3.0
+    avg_rank = (ranks_sp + ranks_pe + ranks_rf) / 3.0
 
-    ranked_cols = sorted(zip(cols, avg_rank), key=lambda x: x[1])
-    return [col for col, _ in ranked_cols[:n]]
+    # Overall ranking (best avg_rank first)
+    ranked_cols = [c for c, _ in sorted(zip(cols, avg_rank), key=lambda x: x[1])]
 
+    # --- Group quota enforcement ---
+    # Prefixes confirmed by user: length, quality, gc, dna, kmer
+    quotas = {
+        "length": 1,
+        "gc": 1,
+        "dna": 1,
+        "quality": 2,
+        "kmer": 2,
+    }
+
+    def in_group(col: str, prefix: str) -> bool:
+        # Match exact prefix or prefix_... (covers "length_min" and "length")
+        return col == prefix or col.startswith(prefix + "_")
+
+    selected = []
+
+    # 1) take quota features from each group, using overall combined ranking order
+    for prefix, q in quotas.items():
+        if q <= 0:
+            continue
+        group_cols = [c for c in ranked_cols if in_group(c, prefix)]
+        selected.extend(group_cols[:q])
+
+    # de-dup while preserving order
+    seen = set()
+    selected = [c for c in selected if not (c in seen or seen.add(c))]
+
+    # 2) backfill to reach n from global ranking
+    for c in ranked_cols:
+        if len(selected) >= n:
+            break
+        if c not in seen:
+            selected.append(c)
+            seen.add(c)
+
+    return selected[:n]
 
 # =========================================================
 # BASE REGRESSORS
@@ -300,7 +331,7 @@ def train_and_evaluate_ensemble(
     """
     # ----- Step 1: evaluate all base models on each feature set -----
     all_model_results = []
-    for n_features in [3, 7, 14, 21]:
+    for n_features in [7, 9, 14, 21]:
         all_model_results.extend(
             evaluate_models_on_feature_set(
                 base_models, X_train, y_train, n_features, feature_sets,
@@ -557,7 +588,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     print("\n3. Selecting features via combined ranking (Spearman + Pearson + RF importance)...")
     feature_sets = {}
-    for n_feat in [3, 7, 14, 21]:
+    for n_feat in [7, 9, 14, 21]:
         feature_sets[n_feat] = select_topn_combined(X_train_scaled, y_train, n_feat, seed=args.seed)
         print(f"  Top {n_feat}: {feature_sets[n_feat]}")
 

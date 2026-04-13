@@ -289,27 +289,14 @@ def quality_hash(quality_scores: list, num_bits: int) -> np.ndarray:
     data = bytes(min(q, 93) for q in quality_scores)
     return _hash_to_bits(data, num_bits)
 
-
 # ---------------------------------------------------------------------------
 # K-mer spectrum -> hashed sketch (fixed vocabulary)
 # ---------------------------------------------------------------------------
 
 _BASE_TO_INT = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 
-# Pre-generated (deterministic) coefficients for fast MinHash
-# Using numpy RNG with a fixed seed for reproducibility across runs.
-# We generate up to 256 so existing code can still request 64/128/256.
-_MINHASH_MAX_PERM = 256
-_rng_mh = np.random.default_rng(12345)
-# Ensure 'a' is odd to improve mixing in mod 2^64 arithmetic
-_MINHASH_A = (_rng_mh.integers(1, np.iinfo(np.uint64).max, size=_MINHASH_MAX_PERM, dtype=np.uint64) | np.uint64(1))
-_MINHASH_B = _rng_mh.integers(0, np.iinfo(np.uint64).max, size=_MINHASH_MAX_PERM, dtype=np.uint64)
-
 def _kmer_set_indices(seq: str, k: int) -> np.ndarray:
-    """
-    Return unique indices (base-4 encoding) of all A/C/G/T k-mers present in seq.
-    Comparable across sequences without storing a 4^k dense vector.
-    """
+    """Return unique base-4 indices of A/C/G/T k-mers present in seq."""
     seq = seq.upper()
     if len(seq) < k:
         return np.array([], dtype=np.uint32)
@@ -329,45 +316,46 @@ def _kmer_set_indices(seq: str, k: int) -> np.ndarray:
 
     if not present:
         return np.array([], dtype=np.uint32)
-
     return np.fromiter(present, dtype=np.uint32)
 
-def _minhash_signature_from_indices(indices: np.ndarray, num_perm: int) -> np.ndarray:
-    """
-    Fast MinHash signature for a set of integer indices using arithmetic hashing:
-      h_i(x) = (a_i * x + b_i) mod 2^64
-    Returns uint64 array length num_perm.
-    """
-    if num_perm > _MINHASH_MAX_PERM:
-        raise ValueError(f"num_perm={num_perm} exceeds max {_MINHASH_MAX_PERM}")
+def _splitmix64(x: np.uint64) -> np.uint64:
+    """Fast 64-bit mixing (SplitMix64). Deterministic, good distribution."""
+    x = (x + np.uint64(0x9E3779B97F4A7C15)) & np.uint64(0xFFFFFFFFFFFFFFFF)
+    z = x
+    z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9) & np.uint64(0xFFFFFFFFFFFFFFFF)
+    z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB) & np.uint64(0xFFFFFFFFFFFFFFFF)
+    return z ^ (z >> np.uint64(31))
 
+def _indices_to_bitset(indices: np.ndarray, num_bits: int, num_hashes: int = 2) -> np.ndarray:
+    """
+    Hash explicit k-mer indices into a compact bitset sketch.
+
+    num_hashes controls sparsity/variance:
+      - 1 is fastest but noisier
+      - 2 is a good default
+      - 3 increases density and collisions
+    """
     if indices.size == 0:
-        return np.full(num_perm, np.iinfo(np.uint64).max, dtype=np.uint64)
+        return np.zeros(num_bits, dtype=np.uint8)
 
-    x = indices.astype(np.uint64)  # shape (m,)
-    a = _MINHASH_A[:num_perm]      # shape (num_perm,)
-    b = _MINHASH_B[:num_perm]      # shape (num_perm,)
-
-    # Compute hashes for all perms and all elements:
-    # H has shape (num_perm, m). Then signature is min across m for each perm.
-    # This is vectorized; much faster than per-seed SHA.
-    H = (a[:, None] * x[None, :] + b[:, None]).astype(np.uint64)
-    sig = H.min(axis=1)
-    return sig
-
-def minhash_jaccard(sig1: np.ndarray, sig2: np.ndarray) -> float:
-    """Jaccard estimate from MinHash signatures."""
-    if sig1.shape != sig2.shape or sig1.size == 0:
-        return 0.0
-    return float(np.mean(sig1 == sig2))
+    bits = np.zeros(num_bits, dtype=np.uint8)
+    # Use different salts to generate multiple hash positions per index
+    for idx in indices.astype(np.uint64):
+        h = _splitmix64(idx)
+        for s in range(num_hashes):
+            # derive additional hashes cheaply
+            h = _splitmix64(h ^ np.uint64(0x9E3779B97F4A7C15 + s))
+            pos = int(h % np.uint64(num_bits))
+            bits[pos] = 1
+    return bits
 
 def kmer_hash(seq: str, k: int, num_bits: int) -> np.ndarray:
     """
-    Return MinHash signature length=num_bits for the explicit k-mer set.
-    'num_bits' kept for compatibility with existing naming (64/128/256).
+    Fixed-vocabulary k-mer set -> hashed bitset sketch (fast).
+    Comparable across sequences and supports Jaccard on the sketches.
     """
     indices = _kmer_set_indices(seq, k)
-    return _minhash_signature_from_indices(indices, num_perm=num_bits)
+    return _indices_to_bitset(indices, num_bits=num_bits, num_hashes=2)
 
 # ---------------------------------------------------------------------------
 # Metrics computation
@@ -384,8 +372,8 @@ def compute_metrics(seq: str, quality_scores: list) -> dict:
     - dna_binary_hash_64/128/256
     - quality_hash_64/128/256
     - kmer_3_hash_64/128/256
+    - kmer_4_hash_64/128/256
     - kmer_5_hash_64/128/256
-    - kmer_7_hash_64/128/256
     """
     metrics = {}
 
@@ -413,7 +401,7 @@ def compute_metrics(seq: str, quality_scores: list) -> dict:
     for bits in (64, 128, 256):
         metrics[f'dna_binary_hash_{bits}'] = dna_binary_hash(seq, bits)
         metrics[f'quality_hash_{bits}'] = quality_hash(quality_scores, bits)
-        for k in (3, 5, 7):
+        for k in (3, 4, 5):
             metrics[f'kmer_{k}_hash_{bits}'] = kmer_hash(seq, k, bits)
 
     return metrics
@@ -446,7 +434,6 @@ def _scalar_features(name: str, v1: float, v2: float) -> dict:
         f'{name}_mean': (v1 + v2) / 2.0,
     }
 
-
 def compute_pair_features(m1: dict, m2: dict) -> dict:
     """
     Compute pair-wise features from two metric dicts.
@@ -463,23 +450,21 @@ def compute_pair_features(m1: dict, m2: dict) -> dict:
     for key in scalar_keys:
         features.update(_scalar_features(key, float(m1[key]), float(m2[key])))
 
-    # Jaccard comparisons for hash metrics
+    # Jaccard comparisons for hashed bitsets
     hash_groups = [
-        ('dna_binary', 'dna_binary_hash', 'bit'),
-        ('quality', 'quality_hash', 'bit'),
-        ('kmer_3', 'kmer_3_hash', 'minhash'),
-        ('kmer_5', 'kmer_5_hash', 'minhash'),
-        ('kmer_7', 'kmer_7_hash', 'minhash'),
+        ('dna_binary', 'dna_binary_hash'),
+        ('quality', 'quality_hash'),
+        ('kmer_3', 'kmer_3_hash'),
+        ('kmer_4', 'kmer_4_hash'),
+        ('kmer_5', 'kmer_5_hash'),
     ]
-    for label, key_prefix, kind in hash_groups:
+    for label, key_prefix in hash_groups:
         for bits in (64, 128, 256):
             col = f'{label}_jaccard_{bits}'
             a = m1[f'{key_prefix}_{bits}']
             b = m2[f'{key_prefix}_{bits}']
-            if kind == 'minhash':
-                features[col] = minhash_jaccard(a, b)
-            else:
-                features[col] = jaccard_similarity(a, b)
+            features[col] = jaccard_similarity(a, b)
+
     return features
 
 

@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import os
+import warnings
 
 import joblib
 import numpy as np
@@ -106,6 +107,17 @@ def expand_features(X: pd.DataFrame) -> pd.DataFrame:
 # FEATURE SELECTION
 # =========================================================
 
+# Minimum number of features guaranteed per group (prefix).
+# Total quota = 7, matching the smallest evaluated feature-set size.
+GROUP_QUOTAS: dict[str, int] = {
+    "length":  1,
+    "gc":      1,
+    "dna":     1,
+    "quality": 2,
+    "kmer":    2,
+}
+
+
 def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -> list:
     """
     Select the top-n features using a combined ranking of three metrics:
@@ -116,6 +128,13 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
     Each metric is converted to a rank (rank 1 = best score).  The average
     rank across the three metrics is computed per feature; features with the
     lowest average rank are selected.
+
+    Group quotas (by column prefix) are enforced first using GROUP_QUOTAS:
+      length: 1, gc: 1, dna: 1, quality: 2, kmer: 2  (total = 7).
+    Remaining slots (for n > 7) are filled from the global combined ranking,
+    excluding already-selected features.  If a group has fewer features than
+    its quota, all available ones are taken and the shortfall is backfilled
+    from the global ranking.
 
     All computations use only the data passed in (no leakage when called on
     training data exclusively).
@@ -162,8 +181,38 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
     ranks_rf = to_rank(rf_scores)
     avg_rank  = (ranks_sp + ranks_pe + ranks_rf) / 3.0
 
+    # Global ranking: ascending avg_rank = best first
     ranked_cols = sorted(zip(cols, avg_rank), key=lambda x: x[1])
-    return [col for col, _ in ranked_cols[:n]]
+
+    # Step 1: enforce group quotas
+    selected: list[str] = []
+    selected_set: set[str] = set()
+    for prefix, quota in GROUP_QUOTAS.items():
+        pref = f"{prefix}_"
+        group = [(col, rank) for col, rank in ranked_cols if col.startswith(pref)]
+        taken = 0
+        for col, _ in group:
+            if taken >= quota:
+                break
+            selected.append(col)
+            selected_set.add(col)
+            taken += 1
+        if taken < quota:
+            warnings.warn(
+                f"Group '{prefix}' has only {taken} feature(s), quota was {quota}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    # Step 2: fill remaining slots from global ranking (excluding already selected)
+    for col, _ in ranked_cols:
+        if len(selected) >= n:
+            break
+        if col not in selected_set:
+            selected.append(col)
+            selected_set.add(col)
+
+    return selected[:n]
 
 
 # =========================================================
@@ -300,7 +349,7 @@ def train_and_evaluate_ensemble(
     """
     # ----- Step 1: evaluate all base models on each feature set -----
     all_model_results = []
-    for n_features in [3, 7, 14, 21]:
+    for n_features in [7, 14, 21]:
         all_model_results.extend(
             evaluate_models_on_feature_set(
                 base_models, X_train, y_train, n_features, feature_sets,
@@ -557,7 +606,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     print("\n3. Selecting features via combined ranking (Spearman + Pearson + RF importance)...")
     feature_sets = {}
-    for n_feat in [3, 7, 14, 21]:
+    for n_feat in [7, 14, 21]:
         feature_sets[n_feat] = select_topn_combined(X_train_scaled, y_train, n_feat, seed=args.seed)
         print(f"  Top {n_feat}: {feature_sets[n_feat]}")
 

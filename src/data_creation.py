@@ -327,24 +327,21 @@ def _splitmix64(x: np.uint64) -> np.uint64:
         z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB) & np.uint64(0xFFFFFFFFFFFFFFFF)
         return z ^ (z >> np.uint64(31))
 
-def _indices_to_bitset(indices: np.ndarray, num_bits: int, num_hashes: int = 2) -> np.ndarray:
+def _indices_to_bitset(indices: np.ndarray, num_bits: int, num_hashes: int = 1) -> np.ndarray:
     """
     Hash explicit k-mer indices into a compact bitset sketch.
 
     num_hashes controls sparsity/variance:
-      - 1 is fastest but noisier
-      - 2 is a good default
-      - 3 increases density and collisions
+      - 1 is fastest and usually sufficient for 3/4/5-mers
+      - 2 increases density/collisions; only use if needed
     """
     if indices.size == 0:
         return np.zeros(num_bits, dtype=np.uint8)
 
     bits = np.zeros(num_bits, dtype=np.uint8)
-    # Use different salts to generate multiple hash positions per index
     for idx in indices.astype(np.uint64):
         h = _splitmix64(idx)
         for s in range(num_hashes):
-            # derive additional hashes cheaply
             h = _splitmix64(h ^ np.uint64(0x9E3779B97F4A7C15 + s))
             pos = int(h % np.uint64(num_bits))
             bits[pos] = 1
@@ -356,7 +353,7 @@ def kmer_hash(seq: str, k: int, num_bits: int) -> np.ndarray:
     Comparable across sequences and supports Jaccard on the sketches.
     """
     indices = _kmer_set_indices(seq, k)
-    return _indices_to_bitset(indices, num_bits=num_bits, num_hashes=2)
+    return _indices_to_bitset(indices, num_bits=num_bits, num_hashes=1)
 
 # ---------------------------------------------------------------------------
 # Metrics computation
@@ -399,11 +396,8 @@ def compute_metrics(seq: str, quality_scores: list) -> dict:
     metrics['gc_content'] = (gc / len(seq) * 100.0) if seq else 0.0
 
     # Hash bit arrays (stored as np.ndarray, used only internally for Jaccard)
-    for bits in (64, 128, 256):
-        metrics[f'dna_binary_hash_{bits}'] = dna_binary_hash(seq, bits)
-        metrics[f'quality_hash_{bits}'] = quality_hash(quality_scores, bits)
-        for k in (3, 4, 5):
-            metrics[f'kmer_{k}_hash_{bits}'] = kmer_hash(seq, k, bits)
+    for k in (3, 4, 5):
+        metrics[f'kmer_{k}_hash_{bits}'] = kmer_hash(seq, k, bits)
 
     return metrics
 
@@ -442,7 +436,6 @@ def compute_pair_features(m1: dict, m2: dict) -> dict:
     """
     features = {}
 
-    # Scalar comparisons: length, quality stats, gc_content
     scalar_keys = [
         'length',
         'quality_mean', 'quality_median', 'quality_q25', 'quality_q75',
@@ -451,7 +444,6 @@ def compute_pair_features(m1: dict, m2: dict) -> dict:
     for key in scalar_keys:
         features.update(_scalar_features(key, float(m1[key]), float(m2[key])))
 
-    # Jaccard comparisons for hashed bitsets
     hash_groups = [
         ('dna_binary', 'dna_binary_hash'),
         ('quality', 'quality_hash'),

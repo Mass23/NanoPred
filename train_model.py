@@ -113,7 +113,14 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
       2. |Pearson correlation| with target
       3. RandomForest feature importance (trained on X, y)
 
-    NEW: Enforce group quotas by prefix:
+    Change vs previous:
+      - Features are expanded into base/log/sqrt variants (handled upstream).
+      - This selector now enforces that for each *base feature* we keep ONLY the
+        best-performing transform among:
+            base, base__log, base__sqrt
+        so top-N contains unique base features (no triple-counting).
+
+    NEW: Enforce group quotas by prefix on the chosen base-feature winners:
       - length: 1
       - gc: 1
       - dna: 1
@@ -127,6 +134,7 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
     cols = X.columns.tolist()
     y_vals = y.values
 
+    # ---------- score each (possibly-transformed) column ----------
     spearman_scores = []
     pearson_scores = []
     for col in cols:
@@ -157,11 +165,29 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
     ranks_rf = to_rank(rf_scores)
     avg_rank = (ranks_sp + ranks_pe + ranks_rf) / 3.0
 
-    # Overall ranking (best avg_rank first)
-    ranked_cols = [c for c, _ in sorted(zip(cols, avg_rank), key=lambda x: x[1])]
+    # ---------- collapse transforms: choose best per base feature ----------
+    def base_name(col: str) -> str:
+        # expand_features() uses "__log" and "__sqrt"
+        if col.endswith("__log"):
+            return col[:-5]
+        if col.endswith("__sqrt"):
+            return col[:-6]
+        return col
 
-    # --- Group quota enforcement ---
-    # Prefixes confirmed by user: length, quality, gc, dna, kmer
+    # For each base feature, pick the transform column with lowest avg_rank (best)
+    best_col_for_base = {}   # base -> chosen col
+    best_rank_for_base = {}  # base -> chosen rank
+    for c, r in zip(cols, avg_rank):
+        b = base_name(c)
+        if (b not in best_rank_for_base) or (r < best_rank_for_base[b]):
+            best_rank_for_base[b] = float(r)
+            best_col_for_base[b] = c
+
+    # Overall ranking of base features (best avg_rank first), but return chosen cols
+    ranked_bases = [b for b, _ in sorted(best_rank_for_base.items(), key=lambda x: x[1])]
+    ranked_cols = [best_col_for_base[b] for b in ranked_bases]
+
+    # ---------- group quota enforcement on base features ----------
     quotas = {
         "length": 1,
         "gc": 1,
@@ -170,32 +196,34 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
         "kmer": 2,
     }
 
-    def in_group(col: str, prefix: str) -> bool:
+    def in_group_base(b: str, prefix: str) -> bool:
         # Match exact prefix or prefix_... (covers "length_min" and "length")
-        return col == prefix or col.startswith(prefix + "_")
+        return b == prefix or b.startswith(prefix + "_")
 
-    selected = []
+    selected_bases = []
 
-    # 1) take quota features from each group, using overall combined ranking order
+    # 1) take quota features from each group, using base ranking order
     for prefix, q in quotas.items():
         if q <= 0:
             continue
-        group_cols = [c for c in ranked_cols if in_group(c, prefix)]
-        selected.extend(group_cols[:q])
+        group_bases = [b for b in ranked_bases if in_group_base(b, prefix)]
+        selected_bases.extend(group_bases[:q])
 
     # de-dup while preserving order
     seen = set()
-    selected = [c for c in selected if not (c in seen or seen.add(c))]
+    selected_bases = [b for b in selected_bases if not (b in seen or seen.add(b))]
 
-    # 2) backfill to reach n from global ranking
-    for c in ranked_cols:
-        if len(selected) >= n:
+    # 2) backfill to reach n from global base ranking
+    for b in ranked_bases:
+        if len(selected_bases) >= n:
             break
-        if c not in seen:
-            selected.append(c)
-            seen.add(c)
+        if b not in seen:
+            selected_bases.append(b)
+            seen.add(b)
 
-    return selected[:n]
+    # Return the chosen transform column for each selected base
+    selected_cols = [best_col_for_base[b] for b in selected_bases[:n]]
+    return selected_cols
 
 # =========================================================
 # BASE REGRESSORS
@@ -331,7 +359,7 @@ def train_and_evaluate_ensemble(
     """
     # ----- Step 1: evaluate all base models on each feature set -----
     all_model_results = []
-    for n_features in [7, 9, 14, 21]:
+    for n_features in [7, 9, 14, 21, 31]:
         all_model_results.extend(
             evaluate_models_on_feature_set(
                 base_models, X_train, y_train, n_features, feature_sets,
@@ -588,7 +616,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     print("\n3. Selecting features via combined ranking (Spearman + Pearson + RF importance)...")
     feature_sets = {}
-    for n_feat in [7, 9, 14, 21]:
+    for n_feat in [7, 9, 14, 21, 31]:
         feature_sets[n_feat] = select_topn_combined(X_train_scaled, y_train, n_feat, seed=args.seed)
         print(f"  Top {n_feat}: {feature_sets[n_feat]}")
 

@@ -395,7 +395,7 @@ def train_and_evaluate_ensemble(
     # Train meta-learner on OOF predictions
     meta_scaler = StandardScaler()
     oof_scaled = meta_scaler.fit_transform(oof_preds)
-    meta_learner = Ridge(alpha=1.0)
+    meta_learner = MLPRegressor(hidden_layer_sizes=(50, 25), max_iter=1000)
     meta_learner.fit(oof_scaled, y_train)
 
     # Train final base models on full training set

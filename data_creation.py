@@ -60,6 +60,24 @@ def main():
         default=1000,
         help="Number of pairs to process per batch (default: 1000).",
     )
+    parser.add_argument(
+        "--shard-id",
+        type=int,
+        default=0,
+        help=(
+            "Index of this shard (0-indexed). Use with --num-shards to split "
+            "dataset generation across multiple processes. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help=(
+            "Total number of shards. When > 1, each shard writes to a separate "
+            "file (e.g. all_pairs_data.part0.csv). Default: 1 (no sharding)."
+        ),
+    )
     args = parser.parse_args()
 
     fasta_paths = [p.strip() for p in args.fasta.split(',') if p.strip()]
@@ -72,6 +90,8 @@ def main():
         primer3=args.primer3,
         seed=args.seed,
         chunk_size=args.chunk_size,
+        shard_id=args.shard_id,
+        num_shards=args.num_shards,
     )
 
 

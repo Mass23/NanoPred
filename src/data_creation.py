@@ -6,6 +6,7 @@ with real_percent_identity (from alignment) as the target variable and various
 sequence metrics as features.
 """
 
+import itertools
 import os
 import random
 import hashlib
@@ -271,89 +272,72 @@ def _hash_to_bits(data: bytes, num_bits: int) -> np.ndarray:
     return np.array(bits[:num_bits], dtype=np.uint8)
 
 
-def dna_binary_hash(seq: str, num_bits: int) -> np.ndarray:
-    """
-    Convert DNA sequence to binary then hash to num_bits.
-    Mapping: A=00, T=01, G=10, C=11.  Ambiguous/unknown bases (e.g. N) are
-    encoded as 00 (same as A) because they represent masked positions and carry
-    no distinct information in the binary representation.
-    """
-    mapping = {'A': '00', 'T': '01', 'G': '10', 'C': '11'}
-    binary_str = ''.join(mapping.get(b, '00') for b in seq.upper())
-    return _hash_to_bits(binary_str.encode(), num_bits)
-
-
 def quality_hash(quality_scores: list, num_bits: int) -> np.ndarray:
     """Hash quality score array to num_bits. Phred scores are capped at 93
     (the maximum valid Phred+33 FASTQ value) before encoding."""
     data = bytes(min(q, 93) for q in quality_scores)
     return _hash_to_bits(data, num_bits)
 
+
 # ---------------------------------------------------------------------------
-# K-mer spectrum -> hashed sketch (fixed vocabulary)
+# K-mer spectrum (explicit fixed vocabulary, comparable across sequences)
 # ---------------------------------------------------------------------------
 
-_BASE_TO_INT = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+def _build_kmer_vocabulary(k: int) -> dict:
+    """Return a mapping from every ACGT k-mer to its index (alphabetical order)."""
+    return {''.join(p): i for i, p in enumerate(itertools.product('ACGT', repeat=k))}
 
-def _kmer_set_indices(seq: str, k: int) -> np.ndarray:
-    """Return unique base-4 indices of A/C/G/T k-mers present in seq."""
+
+# Pre-built vocabularies for k = 3 (64), 4 (256), 5 (1024)
+_KMER_VOCABULARIES: dict[int, dict[str, int]] = {k: _build_kmer_vocabulary(k) for k in (3, 4, 5)}
+
+
+def kmer_spectrum(seq: str, k: int) -> np.ndarray:
+    """
+    Compute the k-mer count spectrum for *seq* using a fixed ACGT vocabulary.
+
+    Returns a uint16 array of length 4^k indexed by the fixed vocabulary so
+    that spectra from different sequences are directly comparable.
+
+    dtype=uint16 (max 65535) is used instead of uint8 (max 255) because a
+    3-mer can occur up to ~len(seq) times; for sequences up to 2000 bp the
+    most common 3-mer can appear ~670 times, well within uint16 range but
+    potentially overflowing uint8.  uint16 is safe for sequences up to ~65535
+    bp and adds negligible memory overhead over uint8.
+    """
+    vocab = _KMER_VOCABULARIES[k]
+    counts = np.zeros(len(vocab), dtype=np.uint16)
     seq = seq.upper()
-    if len(seq) < k:
-        return np.array([], dtype=np.uint32)
-
-    present = set()
     for i in range(len(seq) - k + 1):
-        idx = 0
-        ok = True
-        for ch in seq[i:i+k]:
-            v = _BASE_TO_INT.get(ch)
-            if v is None:
-                ok = False
-                break
-            idx = (idx * 4) + v
-        if ok:
-            present.add(idx)
+        kmer = seq[i:i + k]
+        idx = vocab.get(kmer)
+        if idx is not None:
+            counts[idx] += 1
+    return counts
 
-    if not present:
-        return np.array([], dtype=np.uint32)
-    return np.fromiter(present, dtype=np.uint32)
 
-def _splitmix64(x: np.uint64) -> np.uint64:
-    """Fast 64-bit mixing (SplitMix64). Wraparound overflow is intentional."""
-    with np.errstate(over='ignore'):
-        x = (x + np.uint64(0x9E3779B97F4A7C15)) & np.uint64(0xFFFFFFFFFFFFFFFF)
-        z = x
-        z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9) & np.uint64(0xFFFFFFFFFFFFFFFF)
-        z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB) & np.uint64(0xFFFFFFFFFFFFFFFF)
-        return z ^ (z >> np.uint64(31))
-
-def _indices_to_bitset(indices: np.ndarray, num_bits: int, num_hashes: int = 1) -> np.ndarray:
+def kmer_jaccard(counts1: np.ndarray, counts2: np.ndarray, weighted: bool = False) -> float:
     """
-    Hash explicit k-mer indices into a compact bitset sketch.
+    Compute Jaccard similarity between two k-mer count spectra.
 
-    num_hashes controls sparsity/variance:
-      - 1 is fastest and usually sufficient for 3/4/5-mers
-      - 2 increases density/collisions; only use if needed
-    """
-    if indices.size == 0:
-        return np.zeros(num_bits, dtype=np.uint8)
+    weighted=False (default):
+        Set/presence Jaccard — treats each k-mer as present or absent.
+        J = |A ∩ B| / |A ∪ B|  where A, B are the sets of observed k-mers.
 
-    bits = np.zeros(num_bits, dtype=np.uint8)
-    for idx in indices.astype(np.uint64):
-        h = _splitmix64(idx)
-        for s in range(num_hashes):
-            h = _splitmix64(h ^ np.uint64(0x9E3779B97F4A7C15 + s))
-            pos = int(h % np.uint64(num_bits))
-            bits[pos] = 1
-    return bits
-
-def kmer_hash(seq: str, k: int, num_bits: int) -> np.ndarray:
+    weighted=True:
+        Count-based (weighted) Jaccard.
+        J = Σ min(c1, c2) / Σ max(c1, c2)
     """
-    Fixed-vocabulary k-mer set -> hashed bitset sketch (fast).
-    Comparable across sequences and supports Jaccard on the sketches.
-    """
-    indices = _kmer_set_indices(seq, k)
-    return _indices_to_bitset(indices, num_bits=num_bits, num_hashes=1)
+    if weighted:
+        intersection = float(np.sum(np.minimum(counts1, counts2)))
+        union = float(np.sum(np.maximum(counts1, counts2)))
+        return intersection / union if union > 0 else 0.0
+    else:
+        p1 = counts1 > 0
+        p2 = counts2 > 0
+        intersection = float(np.sum(p1 & p2))
+        union = float(np.sum(p1 | p2))
+        return intersection / union if union > 0 else 0.0
 
 # ---------------------------------------------------------------------------
 # Metrics computation
@@ -367,11 +351,10 @@ def compute_metrics(seq: str, quality_scores: list) -> dict:
     - length
     - quality_mean, quality_median, quality_q25, quality_q75
     - gc_content
-    - dna_binary_hash_64/128/256
     - quality_hash_64/128/256
-    - kmer_3_hash_64/128/256
-    - kmer_4_hash_64/128/256
-    - kmer_5_hash_64/128/256
+    - kmer_3_spectrum, kmer_4_spectrum, kmer_5_spectrum
+      (uint16 arrays indexed by fixed ACGT vocabulary; use kmer_jaccard() for
+      both non-weighted and weighted Jaccard in compute_pair_features)
     """
     metrics = {}
 
@@ -395,12 +378,13 @@ def compute_metrics(seq: str, quality_scores: list) -> dict:
     gc = seq.count('G') + seq.count('C')
     metrics['gc_content'] = (gc / len(seq) * 100.0) if seq else 0.0
 
+    # Quality hash (bitset sketch)
     for bits in (64, 128, 256):
-        metrics[f'dna_binary_hash_{bits}'] = dna_binary_hash(seq, bits)
         metrics[f'quality_hash_{bits}'] = quality_hash(quality_scores, bits)
 
-        for k in (3, 4, 5):
-            metrics[f'kmer_{k}_hash_{bits}'] = kmer_hash(seq, k, bits)
+    # k-mer count spectra (fixed vocabulary, comparable across sequences)
+    for k in (3, 4, 5):
+        metrics[f'kmer_{k}_spectrum'] = kmer_spectrum(seq, k)
 
     return metrics
 
@@ -436,6 +420,10 @@ def compute_pair_features(m1: dict, m2: dict) -> dict:
     """
     Compute pair-wise features from two metric dicts.
     Returns flat feature dict (no hash arrays, only scalars).
+
+    K-mer features:
+      kmer_{k}_jaccard          — non-weighted (set/presence) Jaccard for k=3,4,5
+      kmer_{k}_jaccard_weighted — count-based weighted Jaccard for k=3,4,5
     """
     features = {}
 
@@ -447,19 +435,18 @@ def compute_pair_features(m1: dict, m2: dict) -> dict:
     for key in scalar_keys:
         features.update(_scalar_features(key, float(m1[key]), float(m2[key])))
 
-    hash_groups = [
-        ('dna_binary', 'dna_binary_hash'),
-        ('quality', 'quality_hash'),
-        ('kmer_3', 'kmer_3_hash'),
-        ('kmer_4', 'kmer_4_hash'),
-        ('kmer_5', 'kmer_5_hash'),
-    ]
-    for label, key_prefix in hash_groups:
-        for bits in (64, 128, 256):
-            col = f'{label}_jaccard_{bits}'
-            a = m1[f'{key_prefix}_{bits}']
-            b = m2[f'{key_prefix}_{bits}']
-            features[col] = jaccard_similarity(a, b)
+    # Quality hash Jaccard
+    for bits in (64, 128, 256):
+        a = m1[f'quality_hash_{bits}']
+        b = m2[f'quality_hash_{bits}']
+        features[f'quality_jaccard_{bits}'] = jaccard_similarity(a, b)
+
+    # K-mer spectrum Jaccard (non-weighted and weighted)
+    for k in (3, 4, 5):
+        s1 = m1[f'kmer_{k}_spectrum']
+        s2 = m2[f'kmer_{k}_spectrum']
+        features[f'kmer_{k}_jaccard'] = kmer_jaccard(s1, s2, weighted=False)
+        features[f'kmer_{k}_jaccard_weighted'] = kmer_jaccard(s1, s2, weighted=True)
 
     return features
 
@@ -476,24 +463,55 @@ def generate_dataset(
     primer3: str = '',
     seed: int = 42,
     chunk_size: int = 1000,
+    shard_id: int = 0,
+    num_shards: int = 1,
 ) -> None:
     """
     Generate a dataset of num_pairs sequence pairs with computed features.
+
+    Sharding support:
+        When num_shards > 1, this function generates only the pairs assigned to
+        *shard_id* (0-indexed) and writes them to a shard-specific file:
+            <base>.part{shard_id}<ext>   (e.g. all_pairs_data.part3.csv)
+        Each shard uses an independent RNG seeded with ``seed + shard_id`` so
+        results are fully reproducible regardless of execution order.
+        Pairs are sampled on the fly — no large list is pre-allocated.
 
     Args:
         fasta_paths: Path (str) or list of paths to input FASTA file(s).
                      When multiple files are provided, all sequences are pooled
                      together before pair generation.
-        num_pairs:   Number of pairs to generate (e.g. 500_000).
-        output_csv:  Output CSV path.
+        num_pairs:   Total number of pairs across all shards (e.g. 500_000).
+        output_csv:  Output CSV path.  When num_shards > 1, the shard index is
+                     inserted before the file extension.
         primer5:     Forward primer sequence (optional).
         primer3:     Reverse primer sequence (optional).
-        seed:        Random seed for reproducibility.
+        seed:        Global random seed.  Per-shard seed = seed + shard_id.
         chunk_size:  Number of pairs to process per batch before writing.
+        shard_id:    Index of this shard (0 .. num_shards-1).  Default 0.
+        num_shards:  Total number of shards.  Default 1 (no sharding).
     """
-    np.random.seed(seed)
-    random.seed(seed)
-    rng = np.random.default_rng(seed)
+    if num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+    if not (0 <= shard_id < num_shards):
+        raise ValueError(f"shard_id must be in [0, num_shards-1], got {shard_id}/{num_shards}")
+
+    # Per-shard RNG seeding — use a hash to ensure well-separated seeds even
+    # for consecutive shard IDs rather than simple addition.
+    shard_seed = hash((seed, shard_id)) & 0xFFFFFFFF
+    rng = np.random.default_rng(shard_seed)
+
+    # Number of pairs assigned to this shard
+    base_pairs = num_pairs // num_shards
+    extra = num_pairs % num_shards
+    shard_pairs = base_pairs + (1 if shard_id < extra else 0)
+
+    # Shard-specific output path
+    if num_shards > 1:
+        base, ext = os.path.splitext(output_csv)
+        shard_output = f'{base}.part{shard_id}{ext}'
+    else:
+        shard_output = output_csv
 
     # Accept a single path string for backward compatibility.
     if isinstance(fasta_paths, str):
@@ -510,18 +528,28 @@ def generate_dataset(
         raise ValueError(f"No sequences found in {fasta_paths}")
     print(f"Total sequences loaded: {len(sequences)}")
 
-    print(f"Creating {num_pairs} pairs ...")
-    pairs = create_sequence_pairs(sequences, num_pairs, seed=seed)
+    n_seq = len(sequences)
+
+    print(
+        f"Generating {shard_pairs} pairs "
+        f"(shard {shard_id}/{num_shards}, seed {shard_seed}) → {shard_output}"
+    )
 
     first_chunk = True
     rows_written = 0
+    pairs_generated = 0
 
-    with tqdm(total=num_pairs, desc="Generating pairs", unit="pair") as pbar:
-        for chunk_start in range(0, num_pairs, chunk_size):
-            chunk = pairs[chunk_start: chunk_start + chunk_size]
+    with tqdm(total=shard_pairs, desc="Generating pairs", unit="pair") as pbar:
+        while pairs_generated < shard_pairs:
+            this_chunk = min(chunk_size, shard_pairs - pairs_generated)
             chunk_rows = []
 
-            for (_, seq1_raw), (_, seq2_raw) in chunk:
+            for _ in range(this_chunk):
+                i = rng.integers(0, n_seq)
+                j = rng.integers(0, n_seq)
+                seq1_raw = sequences[i][1]
+                seq2_raw = sequences[j][1]
+
                 try:
                     # Process both sequences (trim + error simulation)
                     seq1, q1, _ = process_sequence(seq1_raw, primer5, primer3, rng)
@@ -545,8 +573,6 @@ def generate_dataset(
                     chunk_rows.append(row)
 
                 except (ValueError, TypeError, ZeroDivisionError, StopIteration) as exc:
-                    # Skip pairs that fail due to empty/invalid sequences or
-                    # alignment edge cases; log the reason for debugging.
                     import warnings
                     warnings.warn(f"Skipping pair due to error: {exc}")
                     continue
@@ -554,7 +580,7 @@ def generate_dataset(
             if chunk_rows:
                 df = pd.DataFrame(chunk_rows)
                 df.to_csv(
-                    output_csv,
+                    shard_output,
                     mode='w' if first_chunk else 'a',
                     header=first_chunk,
                     index=False,
@@ -562,6 +588,56 @@ def generate_dataset(
                 first_chunk = False
                 rows_written += len(chunk_rows)
 
-            pbar.update(len(chunk))
+            pairs_generated += this_chunk
+            pbar.update(this_chunk)
 
-    print(f"Done. Wrote {rows_written} rows to {output_csv}.")
+    print(f"Done. Wrote {rows_written} rows to {shard_output}.")
+
+
+# ---------------------------------------------------------------------------
+# Shard merging
+# ---------------------------------------------------------------------------
+
+def merge_shards(
+    output_csv: str,
+    num_shards: int,
+    seed: int = 42,
+    keep_shards: bool = False,
+) -> None:
+    """Merge all shard CSV files into a single shuffled output file.
+
+    Reads ``<base>.part{0..num_shards-1}<ext>``, concatenates them,
+    shuffles the rows (using *seed* for reproducibility), writes the
+    result to *output_csv*, and removes the shard files unless
+    *keep_shards* is True.
+
+    Args:
+        output_csv:  Final output CSV path (e.g. ``all_pairs_data.csv``).
+        num_shards:  Total number of shard files expected.
+        seed:        Random seed used for shuffling (default 42).
+        keep_shards: When True, shard part files are not deleted after
+                     merging (default False).
+    """
+    base, ext = os.path.splitext(output_csv)
+    shard_paths = [f'{base}.part{i}{ext}' for i in range(num_shards)]
+
+    missing = [p for p in shard_paths if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(
+            f"Cannot merge: {len(missing)} shard file(s) not found: {missing[:5]}"
+        )
+
+    print(f"Merging {num_shards} shard(s) into {output_csv} ...")
+    frames = [pd.read_csv(p) for p in shard_paths]
+    df = pd.concat(frames, ignore_index=True)
+
+    print(f"  Shuffling {len(df)} rows (seed={seed}) ...")
+    df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    df.to_csv(output_csv, index=False)
+    print(f"  Wrote {len(df)} rows to {output_csv}.")
+
+    if not keep_shards:
+        for p in shard_paths:
+            os.remove(p)
+        print(f"  Deleted {len(shard_paths)} shard file(s).")

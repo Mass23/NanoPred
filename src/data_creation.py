@@ -592,3 +592,52 @@ def generate_dataset(
             pbar.update(this_chunk)
 
     print(f"Done. Wrote {rows_written} rows to {shard_output}.")
+
+
+# ---------------------------------------------------------------------------
+# Shard merging
+# ---------------------------------------------------------------------------
+
+def merge_shards(
+    output_csv: str,
+    num_shards: int,
+    seed: int = 42,
+    keep_shards: bool = False,
+) -> None:
+    """Merge all shard CSV files into a single shuffled output file.
+
+    Reads ``<base>.part{0..num_shards-1}<ext>``, concatenates them,
+    shuffles the rows (using *seed* for reproducibility), writes the
+    result to *output_csv*, and removes the shard files unless
+    *keep_shards* is True.
+
+    Args:
+        output_csv:  Final output CSV path (e.g. ``all_pairs_data.csv``).
+        num_shards:  Total number of shard files expected.
+        seed:        Random seed used for shuffling (default 42).
+        keep_shards: When True, shard part files are not deleted after
+                     merging (default False).
+    """
+    base, ext = os.path.splitext(output_csv)
+    shard_paths = [f'{base}.part{i}{ext}' for i in range(num_shards)]
+
+    missing = [p for p in shard_paths if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(
+            f"Cannot merge: {len(missing)} shard file(s) not found: {missing[:5]}"
+        )
+
+    print(f"Merging {num_shards} shard(s) into {output_csv} ...")
+    frames = [pd.read_csv(p) for p in shard_paths]
+    df = pd.concat(frames, ignore_index=True)
+
+    print(f"  Shuffling {len(df)} rows (seed={seed}) ...")
+    df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    df.to_csv(output_csv, index=False)
+    print(f"  Wrote {len(df)} rows to {output_csv}.")
+
+    if not keep_shards:
+        for p in shard_paths:
+            os.remove(p)
+        print(f"  Deleted {len(shard_paths)} shard file(s).")

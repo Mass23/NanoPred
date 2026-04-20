@@ -8,10 +8,18 @@ Usage:
     Multiple FASTA files can be provided as a comma-separated list:
     python data_creation.py -f file1.fasta,file2.fasta,file3.fasta \
         -o all_pairs_data.csv -n 500000
+
+    To run sharded generation in parallel and then merge:
+        for i in $(seq 0 23); do
+            python data_creation.py -f seqs.fasta -n 500000 \\
+                --num-shards 24 --shard-id $i &
+        done
+        wait
+        python data_creation.py --merge -o all_pairs_data.csv --num-shards 24
 """
 
 import argparse
-from src.data_creation import generate_dataset
+from src.data_creation import generate_dataset, merge_shards
 
 
 def main():
@@ -20,7 +28,8 @@ def main():
     )
     parser.add_argument(
         "-f", "--fasta",
-        required=True,
+        required=False,
+        default=None,
         help=(
             "Path(s) to input FASTA file(s) containing reference sequences. "
             "Multiple files can be provided as a comma-separated list "
@@ -78,9 +87,41 @@ def main():
             "file (e.g. all_pairs_data.part0.csv). Default: 1 (no sharding)."
         ),
     )
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        default=False,
+        help=(
+            "Merge all shard part files into the final output CSV (shuffled). "
+            "Requires --num-shards > 1. Shard files are deleted after merging "
+            "unless --keep-shards is also given."
+        ),
+    )
+    parser.add_argument(
+        "--keep-shards",
+        action="store_true",
+        default=False,
+        help=(
+            "When --merge is used, keep the individual shard part files after "
+            "merging instead of deleting them (default: delete)."
+        ),
+    )
     args = parser.parse_args()
 
-    fasta_paths = [p.strip() for p in args.fasta.split(',') if p.strip()]
+    if args.merge:
+        if args.num_shards <= 1:
+            parser.error("--merge requires --num-shards > 1")
+        merge_shards(
+            output_csv=args.output,
+            num_shards=args.num_shards,
+            seed=args.seed,
+            keep_shards=args.keep_shards,
+        )
+        return
+
+    fasta_paths = [p.strip() for p in args.fasta.split(',') if p.strip()] if args.fasta else []
+    if not fasta_paths:
+        parser.error("-f/--fasta is required when not using --merge")
 
     generate_dataset(
         fasta_paths=fasta_paths,

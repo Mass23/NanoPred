@@ -108,17 +108,6 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.merge:
-        if args.num_shards <= 1:
-            parser.error("--merge requires --num-shards > 1")
-        merge_shards(
-            output_csv=args.output,
-            num_shards=args.num_shards,
-            seed=args.seed,
-            keep_shards=args.keep_shards,
-        )
-        return
-
     fasta_paths = [p.strip() for p in args.fasta.split(',') if p.strip()] if args.fasta else []
     if not fasta_paths:
         parser.error("-f/--fasta is required when not using --merge")
@@ -135,6 +124,16 @@ def main():
         num_shards=args.num_shards,
     )
 
+    if args.merge:
+            if args.num_shards <= 1:
+                parser.error("--merge requires --num-shards > 1")
+            merge_shards(
+                output_csv=args.output,
+                num_shards=args.num_shards,
+                seed=args.seed,
+                keep_shards=args.keep_shards,
+            )
+            return
 
 if __name__ == "__main__":
     main()

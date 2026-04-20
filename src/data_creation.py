@@ -289,7 +289,7 @@ def _build_kmer_vocabulary(k: int) -> dict:
 
 
 # Pre-built vocabularies for k = 3 (64), 4 (256), 5 (1024)
-_KMER_VOCABULARIES: dict = {k: _build_kmer_vocabulary(k) for k in (3, 4, 5)}
+_KMER_VOCABULARIES: dict[int, dict[str, int]] = {k: _build_kmer_vocabulary(k) for k in (3, 4, 5)}
 
 
 def kmer_spectrum(seq: str, k: int) -> np.ndarray:
@@ -496,8 +496,9 @@ def generate_dataset(
     if not (0 <= shard_id < num_shards):
         raise ValueError(f"shard_id must be in [0, num_shards-1], got {shard_id}/{num_shards}")
 
-    # Per-shard RNG seeding
-    shard_seed = seed + shard_id
+    # Per-shard RNG seeding — use a hash to ensure well-separated seeds even
+    # for consecutive shard IDs rather than simple addition.
+    shard_seed = hash((seed, shard_id)) & 0xFFFFFFFF
     rng = np.random.default_rng(shard_seed)
 
     # Number of pairs assigned to this shard
@@ -544,8 +545,8 @@ def generate_dataset(
             chunk_rows = []
 
             for _ in range(this_chunk):
-                i = int(rng.integers(0, n_seq))
-                j = int(rng.integers(0, n_seq))
+                i = rng.integers(0, n_seq)
+                j = rng.integers(0, n_seq)
                 seq1_raw = sequences[i][1]
                 seq2_raw = sequences[j][1]
 

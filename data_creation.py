@@ -9,17 +9,51 @@ Usage:
     python data_creation.py -f file1.fasta,file2.fasta,file3.fasta \
         -o all_pairs_data.csv -n 500000
 
-    To run sharded generation in parallel and then merge:
-        for i in $(seq 0 23); do
-            python data_creation.py -f seqs.fasta -n 500000 \\
-                --num-shards 24 --shard-id $i &
-        done
-        wait
-        python data_creation.py --merge -o all_pairs_data.csv --num-shards 24
+    To spawn all shards in parallel and then merge automatically:
+    python data_creation.py -f file1.fasta,file2.fasta -o all_pairs_data.csv \
+        -n 2000000 --num-shards 24 --merge
 """
 
 import argparse
+import os
+import subprocess
+import sys
+
 from src.data_creation import generate_dataset, merge_shards
+
+
+def _expected_rows(num_pairs: int, num_shards: int, shard_id: int) -> int:
+    """Return the expected number of data rows for shard *shard_id*."""
+    base = num_pairs // num_shards
+    extra = num_pairs % num_shards
+    return base + (1 if shard_id < extra else 0)
+
+
+def _validate_shard_row_counts(output_csv: str, num_pairs: int, num_shards: int) -> None:
+    """Verify every shard part CSV exists and contains the expected row count.
+
+    Raises ``ValueError`` if any shard file is missing or has a row count
+    that does not match the expected value.  The merge step should only
+    proceed when this function returns without raising.
+    """
+    base, ext = os.path.splitext(output_csv)
+    errors = []
+    for shard_id in range(num_shards):
+        shard_path = f"{base}.part{shard_id}{ext}"
+        expected = _expected_rows(num_pairs, num_shards, shard_id)
+        if not os.path.exists(shard_path):
+            errors.append(f"  shard {shard_id}: file missing ({shard_path})")
+            continue
+        with open(shard_path) as f:
+            actual = sum(1 for _ in f) - 1  # subtract header line
+        if actual != expected:
+            errors.append(
+                f"  shard {shard_id}: expected {expected} rows, got {actual} ({shard_path})"
+            )
+    if errors:
+        raise ValueError(
+            "Row-count validation failed; aborting merge.\n" + "\n".join(errors)
+        )
 
 
 def main():
@@ -74,8 +108,8 @@ def main():
         type=int,
         default=0,
         help=(
-            "Index of this shard (0-indexed). Use with --num-shards to split "
-            "dataset generation across multiple processes. Default: 0."
+            "Index of this shard (0-indexed). Used internally by child "
+            "processes when running in sharded mode. Default: 0."
         ),
     )
     parser.add_argument(
@@ -92,9 +126,10 @@ def main():
         action="store_true",
         default=False,
         help=(
-            "Merge all shard part files into the final output CSV (shuffled). "
-            "Requires --num-shards > 1. Shard files are deleted after merging "
-            "unless --keep-shards is also given."
+            "When set together with --num-shards > 1, spawn all shards as "
+            "child processes, wait for them to finish, validate row counts, "
+            "and then merge the part files into the final output CSV. "
+            "Shard files are deleted after merging unless --keep-shards is given."
         ),
     )
     parser.add_argument(
@@ -108,9 +143,76 @@ def main():
     )
     args = parser.parse_args()
 
-    fasta_paths = [p.strip() for p in args.fasta.split(',') if p.strip()] if args.fasta else []
+    # ------------------------------------------------------------------
+    # Orchestrator mode: spawn all shards then validate and merge.
+    # ------------------------------------------------------------------
+    if args.merge and args.num_shards > 1:
+        if not args.fasta:
+            parser.error("-f/--fasta is required when using --merge")
+
+        # Build the base child command from the current sys.argv, stripping
+        # --merge so children only generate their part (no recursion).
+        base_argv = [a for a in sys.argv[1:] if a != "--merge"]
+
+        print(
+            f"[orchestrator] Spawning {args.num_shards} shard processes "
+            f"(num-pairs={args.num_pairs}) ..."
+        )
+        procs = []
+        try:
+            for shard_id in range(args.num_shards):
+                cmd = [sys.executable, sys.argv[0]] + base_argv + [
+                    "--shard-id", str(shard_id),
+                ]
+                # Inherit stdout/stderr so output is visible directly.
+                procs.append(subprocess.Popen(cmd))
+
+            # Wait for all children.
+            failed = []
+            for shard_id, proc in enumerate(procs):
+                rc = proc.wait()
+                if rc != 0:
+                    failed.append((shard_id, rc))
+        except Exception:
+            # Terminate any still-running children before re-raising.
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.terminate()
+            raise
+
+        if failed:
+            details = ", ".join(f"shard {s} (rc={r})" for s, r in failed)
+            raise RuntimeError(
+                f"{len(failed)} shard process(es) failed: {details}"
+            )
+
+        # Validate row counts before merging.
+        _validate_shard_row_counts(args.output, args.num_pairs, args.num_shards)
+
+        # Merge validated part files.
+        merge_shards(
+            output_csv=args.output,
+            num_shards=args.num_shards,
+            seed=args.seed,
+            keep_shards=args.keep_shards,
+        )
+
+        # Final sanity check: merged file should have exactly num_pairs rows.
+        with open(args.output) as f:
+            merged_rows = sum(1 for _ in f) - 1
+        if merged_rows != args.num_pairs:
+            raise ValueError(
+                f"Merged CSV has {merged_rows} rows but expected {args.num_pairs}."
+            )
+        print(f"[orchestrator] Done. {merged_rows} rows written to {args.output}.")
+        return
+
+    # ------------------------------------------------------------------
+    # Worker / single-run mode: generate one shard (or the full dataset).
+    # ------------------------------------------------------------------
+    fasta_paths = [p.strip() for p in args.fasta.split(",") if p.strip()] if args.fasta else []
     if not fasta_paths:
-        parser.error("-f/--fasta is required when not using --merge")
+        parser.error("-f/--fasta is required")
 
     generate_dataset(
         fasta_paths=fasta_paths,
@@ -124,16 +226,6 @@ def main():
         num_shards=args.num_shards,
     )
 
-    if args.merge:
-            if args.num_shards <= 1:
-                parser.error("--merge requires --num-shards > 1")
-            merge_shards(
-                output_csv=args.output,
-                num_shards=args.num_shards,
-                seed=args.seed,
-                keep_shards=args.keep_shards,
-            )
-            return
 
 if __name__ == "__main__":
     main()

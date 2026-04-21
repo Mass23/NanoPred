@@ -5,7 +5,13 @@ from sequence metrics.
 Pipeline:
   1. Reduced model (fast screen): GC/Length/Quality features only.
      - Regressor thresholded as classifier at multiple cutoffs (0.85–0.99).
-     - Optimized for recall at 0.85.
+     - The fit split is class-balanced (1:1 high/low identity, undersample
+       majority) to improve recall.  Validation and test data are not rebalanced.
+     - Model selection is recall-optimised with a minimum-precision guard:
+         * A validation split (20 % of training data) is used for selection.
+         * Selection score: if precision@85 < PRECISION_MIN → score = -inf
+                            else                            → score = recall@85
+     - Classifier-style metrics are reported on the TEST split only.
      - Saved as reduced_model.pkl.
 
   2. Full model (weighted regression):
@@ -56,6 +62,11 @@ HIGH_THRESHOLD = 85.0
 
 # Thresholds for classifier-style stats on the reduced model (same scale).
 CLASSIFIER_THRESHOLDS = [85.0, 90.0, 95.0, 97.0, 99.0]
+
+# Minimum precision at cutoff 85 required for a reduced-model candidate to be
+# considered during validation-based model selection.  Candidates that fail
+# this floor receive a selection score of -inf and are never chosen as best.
+PRECISION_MIN = 0.10
 
 # Feature set sizes to test for the full model.
 FULL_MODEL_FEATURE_SIZES = [5, 10, 20]
@@ -382,6 +393,7 @@ def train_reduced_model(
     y_test:  pd.Series,
     base_models: list,
     seed: int = 23,
+    precision_min: float = PRECISION_MIN,
 ) -> dict:
     """
     Train and evaluate reduced models using only GC / Length / Quality features.
@@ -389,11 +401,20 @@ def train_reduced_model(
     Steps:
       1. Restrict candidate features to gc/length/quality prefixes.
       2. Select top-10 features via combined ranking (with minimum 1 per group).
-      3. For each base model:
-         - Train on the training set (no sample weights for reduced model).
-         - Evaluate on the test set.
-         - Compute classifier-style stats at thresholds 85, 90, 95, 97, 99.
-      4. Select the best model: maximise recall@85, tie-break by precision@85.
+      3. Split the training set into a fit split (80 %) and a validation split
+         (20 %) used exclusively for recall-optimised model selection.
+      4. Balance the fit split to 1:1 high/low identity by undersampling the
+         majority class (y >= 85 vs y < 85).  The validation and test splits
+         are kept at their natural class distribution.
+      5. For each base model:
+         - Train on the balanced fit split (no explicit sample weights).
+         - Compute precision@85 and recall@85 on the validation split.
+         - Selection score:
+             if precision@85 < precision_min  →  score = -inf  (reject)
+             else                             →  score = recall@85
+      6. Pick the best model by validation selection score.
+      7. Report classifier-style stats on the TEST split at thresholds
+         85, 90, 95, 97, 99.  Test data are never rebalanced.
 
     Returns:
         dict with best_model, best_model_name, features, best_stats,
@@ -419,18 +440,81 @@ def train_reduced_model(
 
     print(f"  Selected features: {reduced_features}")
 
-    X_tr_r = X_train[reduced_features]
+    # ------------------------------------------------------------------
+    # Split training data into fit / validation for model selection.
+    # The test set is reserved exclusively for final metric reporting.
+    # ------------------------------------------------------------------
+    val_rng   = np.random.default_rng(seed)
+    n_train   = len(X_train)
+    val_size  = max(1, int(n_train * 0.20))
+    perm      = val_rng.permutation(n_train)
+    val_idx   = perm[:val_size]
+    fit_idx   = perm[val_size:]
+
+    X_val = X_train.iloc[val_idx][reduced_features]
+    y_val = y_train.iloc[val_idx].values
+
     X_te_r = X_test[reduced_features]
-    y_tr   = y_train.values
     y_te   = y_test.values
+
+    # ------------------------------------------------------------------
+    # Balance the fit split so that high-identity (y >= 85) and
+    # low-identity samples are equally represented during training.
+    # This counters the recall penalty caused by class imbalance.
+    # The validation and test splits are kept at their natural distribution.
+    # ------------------------------------------------------------------
+    y_fit_all = y_train.iloc[fit_idx].values
+    X_fit_all = X_train.iloc[fit_idx][reduced_features]
+
+    high_mask = y_fit_all >= HIGH_THRESHOLD
+    low_mask  = ~high_mask
+    n_high    = int(high_mask.sum())
+    n_low     = int(low_mask.sum())
+
+    if n_high == 0 or n_low == 0:
+        # Degenerate split — fall back to using the full unbalanced fit set.
+        X_fit = X_fit_all
+        y_fit = y_fit_all
+        print(f"  WARNING: Fit split has no {'high' if n_high == 0 else 'low'}-identity "
+              f"samples (threshold={HIGH_THRESHOLD}); skipping balancing — "
+              f"model will train on imbalanced data, which may reduce recall.")
+    else:
+        # Undersample the majority class to match the minority class size,
+        # keeping each class at exactly min(n_high, n_low) samples.
+        n_bal = min(n_high, n_low)
+        bal_rng = np.random.default_rng(seed + 1)
+        high_idx_local = np.where(high_mask)[0]
+        low_idx_local  = np.where(low_mask)[0]
+        chosen_high = bal_rng.choice(high_idx_local, size=n_bal, replace=False)
+        chosen_low  = bal_rng.choice(low_idx_local,  size=n_bal, replace=False)
+        balanced_idx = np.concatenate([chosen_high, chosen_low])
+        bal_rng.shuffle(balanced_idx)
+        X_fit = X_fit_all.iloc[balanced_idx]
+        y_fit = y_fit_all[balanced_idx]
+        print(f"  Fit split balanced: {n_bal} high + {n_bal} low = {len(y_fit):,} "
+              f"(original {len(y_fit_all):,}: {n_high} high / {n_low} low)")
+
+    print(f"  Val split: {len(X_val):,}   Test split: {len(X_te_r):,}  "
+          f"(precision_min={precision_min})")
 
     model_stats = []
 
     for name, model in base_models:
         m = clone(model)
-        m.fit(X_tr_r, y_tr)
-        y_pred = m.predict(X_te_r)
+        m.fit(X_fit, y_fit)
 
+        # --- Validation-based selection score ---
+        y_val_pred  = m.predict(X_val)
+        val_stats85 = compute_classifier_stats(y_val, y_val_pred, 85.0)
+        val_prec85  = val_stats85['precision']
+        val_rec85   = val_stats85['recall']
+        if val_prec85 < precision_min:
+            sel_score = float('-inf')
+        else:
+            sel_score = val_rec85
+
+        # --- Test-split metrics (for reporting only) ---
+        y_pred    = m.predict(X_te_r)
         test_r2   = r2_score(y_te, y_pred)
         test_mae  = mean_absolute_error(y_te, y_pred)
         test_rmse = float(np.sqrt(mean_squared_error(y_te, y_pred)))
@@ -441,28 +525,39 @@ def train_reduced_model(
         ]
         stats_85 = thresh_stats[0]   # first threshold is 85.0
 
-        print(f"  [{name}] R²={test_r2:.4f} | "
-              f"recall@85={stats_85['recall']:.4f}  "
-              f"prec@85={stats_85['precision']:.4f}  "
-              f"f1@85={stats_85['f1']:.4f}")
+        print(f"  [{name}] val_sel={sel_score:.4f} "
+              f"(val_prec@85={val_prec85:.4f}, val_rec@85={val_rec85:.4f}) | "
+              f"test R²={test_r2:.4f}  test_recall@85={stats_85['recall']:.4f}  "
+              f"test_prec@85={stats_85['precision']:.4f}")
 
         model_stats.append({
-            'model_name':  name,
-            'model':       m,
-            'features':    reduced_features,
-            'test_r2':     test_r2,
-            'test_mae':    test_mae,
-            'test_rmse':   test_rmse,
-            'thresh_stats': thresh_stats,
-            'recall_85':   stats_85['recall'],
-            'precision_85': stats_85['precision'],
-            'f1_85':       stats_85['f1'],
+            'model_name':    name,
+            'model':         m,
+            'features':      reduced_features,
+            'sel_score':     sel_score,
+            'val_prec85':    val_prec85,
+            'val_rec85':     val_rec85,
+            'test_r2':       test_r2,
+            'test_mae':      test_mae,
+            'test_rmse':     test_rmse,
+            'thresh_stats':  thresh_stats,
+            'recall_85':     stats_85['recall'],
+            'precision_85':  stats_85['precision'],
+            'f1_85':         stats_85['f1'],
         })
 
-    best = max(model_stats, key=lambda x: (x['recall_85'], x['precision_85']))
+    best = max(model_stats, key=lambda x: x['sel_score'])
+    if best['sel_score'] == float('-inf'):
+        print(f"\n  WARNING: All reduced-model candidates had precision@85 < "
+              f"{precision_min} on the validation split. "
+              f"Returning the candidate with the highest validation recall@85 "
+              f"(precision floor not met).")
+        best = max(model_stats, key=lambda x: x['val_rec85'])
+
     print(f"\n  Best reduced model: {best['model_name']} "
-          f"(recall@85={best['recall_85']:.4f}, "
-          f"prec@85={best['precision_85']:.4f})")
+          f"(val_sel={best['sel_score']:.4f}, "
+          f"val_rec@85={best['val_rec85']:.4f}, "
+          f"val_prec@85={best['val_prec85']:.4f})")
 
     return {
         'best_model':      best['model'],

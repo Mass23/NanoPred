@@ -288,8 +288,8 @@ def _build_kmer_vocabulary(k: int) -> dict:
     return {''.join(p): i for i, p in enumerate(itertools.product('ACGT', repeat=k))}
 
 
-# Pre-built vocabularies for k = 3 (64), 4 (256), 5 (1024)
-_KMER_VOCABULARIES: dict[int, dict[str, int]] = {k: _build_kmer_vocabulary(k) for k in (3, 4, 5)}
+# Pre-built vocabularies for k = 3 (64) and k = 5 (1024)
+_KMER_VOCABULARIES: dict[int, dict[str, int]] = {k: _build_kmer_vocabulary(k) for k in (3, 5)}
 
 
 def kmer_spectrum(seq: str, k: int) -> np.ndarray:
@@ -339,6 +339,39 @@ def kmer_jaccard(counts1: np.ndarray, counts2: np.ndarray, weighted: bool = Fals
         union = float(np.sum(p1 | p2))
         return intersection / union if union > 0 else 0.0
 
+
+def kmer_presence_sketch(seq: str, k: int, num_bits: int) -> np.ndarray:
+    """
+    Compute a presence-based bit sketch for the k-mers in *seq*.
+
+    Each observed k-mer's vocabulary index is hashed to two positions in a
+    bit array of length *num_bits* (using two independent hash seeds).
+    Jaccard similarity between two such sketches approximates the set
+    (presence) Jaccard between the two k-mer sets — faster to compute at
+    query time than exact Jaccard on full spectra.
+
+    Args:
+        seq:      DNA sequence (upper-cased internally).
+        k:        k-mer length (3 or 5; must be a key in _KMER_VOCABULARIES).
+        num_bits: Length of the output bit array (64, 128, 256 or 512).
+
+    Returns:
+        np.ndarray of dtype uint8, shape (num_bits,), with values in {0, 1}.
+    """
+    vocab = _KMER_VOCABULARIES[k]
+    sketch = np.zeros(num_bits, dtype=np.uint8)
+    seq = seq.upper()
+    for i in range(len(seq) - k + 1):
+        kmer = seq[i:i + k]
+        idx = vocab.get(kmer)
+        if idx is not None:
+            idx_bytes = idx.to_bytes(2, 'big')
+            h1 = _mmh3_like_hash(idx_bytes, seed=0) % num_bits
+            h2 = _mmh3_like_hash(idx_bytes, seed=1) % num_bits
+            sketch[h1] = 1
+            sketch[h2] = 1
+    return sketch
+
 # ---------------------------------------------------------------------------
 # Metrics computation
 # ---------------------------------------------------------------------------
@@ -352,9 +385,9 @@ def compute_metrics(seq: str, quality_scores: list) -> dict:
     - quality_mean, quality_median, quality_q25, quality_q75
     - gc_content
     - quality_hash_64/128/256
-    - kmer_3_spectrum, kmer_4_spectrum, kmer_5_spectrum
-      (uint16 arrays indexed by fixed ACGT vocabulary; use kmer_jaccard() for
-      both non-weighted and weighted Jaccard in compute_pair_features)
+    - kmer_{k}_sketch_{bits} for k in (3, 5) and bits in (64, 128, 256, 512)
+      (uint8 presence-sketch bit arrays; use jaccard_similarity() in
+      compute_pair_features to get kmer_{k}_hashjaccard_{bits} features)
     """
     metrics = {}
 
@@ -382,9 +415,10 @@ def compute_metrics(seq: str, quality_scores: list) -> dict:
     for bits in (64, 128, 256):
         metrics[f'quality_hash_{bits}'] = quality_hash(quality_scores, bits)
 
-    # k-mer count spectra (fixed vocabulary, comparable across sequences)
-    for k in (3, 4, 5):
-        metrics[f'kmer_{k}_spectrum'] = kmer_spectrum(seq, k)
+    # k-mer presence sketches (fixed vocabulary, comparable across sequences)
+    for k in (3, 5):
+        for bits in (64, 128, 256, 512):
+            metrics[f'kmer_{k}_sketch_{bits}'] = kmer_presence_sketch(seq, k, bits)
 
     return metrics
 
@@ -422,8 +456,8 @@ def compute_pair_features(m1: dict, m2: dict) -> dict:
     Returns flat feature dict (no hash arrays, only scalars).
 
     K-mer features:
-      kmer_{k}_jaccard          — non-weighted (set/presence) Jaccard for k=3,4,5
-      kmer_{k}_jaccard_weighted — count-based weighted Jaccard for k=3,4,5
+      kmer_{k}_hashjaccard_{bits} — presence-sketch Jaccard for k in (3, 5)
+                                    and bits in (64, 128, 256, 512)
     """
     features = {}
 
@@ -441,12 +475,12 @@ def compute_pair_features(m1: dict, m2: dict) -> dict:
         b = m2[f'quality_hash_{bits}']
         features[f'quality_jaccard_{bits}'] = jaccard_similarity(a, b)
 
-    # K-mer spectrum Jaccard (non-weighted and weighted)
-    for k in (3, 4, 5):
-        s1 = m1[f'kmer_{k}_spectrum']
-        s2 = m2[f'kmer_{k}_spectrum']
-        features[f'kmer_{k}_jaccard'] = kmer_jaccard(s1, s2, weighted=False)
-        features[f'kmer_{k}_jaccard_weighted'] = kmer_jaccard(s1, s2, weighted=True)
+    # K-mer presence-sketch Jaccard (hash-jaccard) for k=3 and k=5
+    for k in (3, 5):
+        for bits in (64, 128, 256, 512):
+            a = m1[f'kmer_{k}_sketch_{bits}']
+            b = m2[f'kmer_{k}_sketch_{bits}']
+            features[f'kmer_{k}_hashjaccard_{bits}'] = jaccard_similarity(a, b)
 
     return features
 
@@ -591,6 +625,26 @@ def generate_dataset(
             pairs_generated += this_chunk
             pbar.update(this_chunk)
 
+    # Always ensure the part file exists (header-only if no rows were written),
+    # so that the merge step can find all expected shard files.
+    if first_chunk:
+        # No rows were written — write a header-only CSV so the file exists.
+        # Build column names from the known schema without computing metrics.
+        scalar_keys = [
+            'length',
+            'quality_mean', 'quality_median', 'quality_q25', 'quality_q75',
+            'gc_content',
+        ]
+        columns = ['real_percent_identity']
+        columns += [f'{k}{s}' for k in scalar_keys for s in ('_min', '_max', '_diff', '_mean')]
+        columns += [f'quality_jaccard_{bits}' for bits in (64, 128, 256)]
+        columns += [
+            f'kmer_{k}_hashjaccard_{bits}'
+            for k in (3, 5)
+            for bits in (64, 128, 256, 512)
+        ]
+        pd.DataFrame(columns=columns).to_csv(shard_output, index=False)
+
     print(f"Done. Wrote {rows_written} rows to {shard_output}.")
 
 
@@ -623,8 +677,12 @@ def merge_shards(
 
     missing = [p for p in shard_paths if not os.path.exists(p)]
     if missing:
+        missing_ids = [i for i, p in enumerate(shard_paths) if not os.path.exists(p)]
         raise FileNotFoundError(
-            f"Cannot merge: {len(missing)} shard file(s) not found: {missing[:5]}"
+            f"Cannot merge: {len(missing)} shard file(s) not found.\n"
+            f"  Missing shard IDs: {missing_ids}\n"
+            f"  Missing paths: {missing}\n"
+            f"Check per-shard logs for errors (e.g. {base}.shard_<id>.log)."
         )
 
     print(f"Merging {num_shards} shard(s) into {output_csv} ...")

@@ -22,39 +22,34 @@ Usage:
 """
 
 import argparse
+import os
 import subprocess
 import sys
 
 from src.data_creation import generate_dataset, merge_shards
 
 
-def _build_shard_cmd(base_argv: list, shard_id: int, num_shards: int) -> list:
-    """Build the subprocess command for one shard from the parent argv.
+def _build_shard_cmd(args, shard_id: int, fasta_paths: list) -> list:
+    """Build the subprocess command for one shard from the parsed argument namespace.
 
-    Strips flags that must not be forwarded to child shards (--run-sharded,
-    --merge-only, --merge) and any existing --shard-id / --num-shards values,
-    then appends the per-shard values.
+    Reconstructs the command explicitly from args so that only known, relevant
+    flags are forwarded — avoids brittle argv filtering.
     """
-    skip_flags = {'--run-sharded', '--merge-only', '--merge'}
-    skip_with_value = {'--shard-id', '--num-shards'}
-
-    filtered = []
-    i = 0
-    while i < len(base_argv):
-        arg = base_argv[i]
-        if arg in skip_flags:
-            i += 1
-        elif arg in skip_with_value:
-            i += 2  # skip flag and its value
-        else:
-            filtered.append(arg)
-            i += 1
-
-    return (
-        [sys.executable, __file__]
-        + filtered
-        + ['--shard-id', str(shard_id), '--num-shards', str(num_shards)]
-    )
+    cmd = [
+        sys.executable, __file__,
+        '-f', ','.join(fasta_paths),
+        '-o', args.output,
+        '-n', str(args.num_pairs),
+        '--seed', str(args.seed),
+        '--chunk-size', str(args.chunk_size),
+        '--num-shards', str(args.num_shards),
+        '--shard-id', str(shard_id),
+    ]
+    if args.primer5:
+        cmd += ['-p1', args.primer5]
+    if args.primer3:
+        cmd += ['-p2', args.primer3]
+    return cmd
 
 
 def main():
@@ -202,24 +197,29 @@ def main():
         if args.num_shards <= 1:
             parser.error("--run-sharded requires --num-shards > 1")
 
-        base, ext = __import__('os').path.splitext(args.output)
+        base, ext = os.path.splitext(args.output)
         procs = []
-        log_files = []
-        base_argv = sys.argv[1:]  # everything after the script name
-        for shard_id in range(args.num_shards):
-            cmd = _build_shard_cmd(base_argv, shard_id=shard_id, num_shards=args.num_shards)
-            log_path = f'{base}.shard_{shard_id}.log'
-            log_files.append(log_path)
-            log_fh = open(log_path, 'w')
-            procs.append((shard_id, subprocess.Popen(cmd, stdout=log_fh, stderr=log_fh), log_fh))
+        log_fhs = []
+        try:
+            for shard_id in range(args.num_shards):
+                cmd = _build_shard_cmd(args, shard_id=shard_id, fasta_paths=fasta_paths)
+                log_path = f'{base}.shard_{shard_id}.log'
+                # File handles must remain open for the lifetime of each subprocess
+                # (Popen inherits them for stdout/stderr), so they are collected and
+                # closed explicitly in the finally block rather than via context managers.
+                log_fh = open(log_path, 'w')  # noqa: WPS515
+                log_fhs.append(log_fh)
+                procs.append((shard_id, subprocess.Popen(cmd, stdout=log_fh, stderr=log_fh)))
 
-        print(f"Launched {args.num_shards} shard processes. Waiting for completion ...")
-        failed = []
-        for shard_id, proc, log_fh in procs:
-            ret = proc.wait()
-            log_fh.close()
-            if ret != 0:
-                failed.append(shard_id)
+            print(f"Launched {args.num_shards} shard processes. Waiting for completion ...")
+            failed = []
+            for shard_id, proc in procs:
+                ret = proc.wait()
+                if ret != 0:
+                    failed.append(shard_id)
+        finally:
+            for fh in log_fhs:
+                fh.close()
 
         if failed:
             print(

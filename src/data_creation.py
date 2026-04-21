@@ -629,14 +629,21 @@ def generate_dataset(
     # so that the merge step can find all expected shard files.
     if first_chunk:
         # No rows were written — write a header-only CSV so the file exists.
-        dummy_row = {'real_percent_identity': []}
-        dummy_row.update(compute_pair_features(
-            compute_metrics('ACGT', [30, 30, 30, 30]),
-            compute_metrics('ACGT', [30, 30, 30, 30]),
-        ))
-        pd.DataFrame({k: pd.Series([], dtype=float) for k in dummy_row}).to_csv(
-            shard_output, index=False
-        )
+        # Build column names from the known schema without computing metrics.
+        scalar_keys = [
+            'length',
+            'quality_mean', 'quality_median', 'quality_q25', 'quality_q75',
+            'gc_content',
+        ]
+        columns = ['real_percent_identity']
+        columns += [f'{k}{s}' for k in scalar_keys for s in ('_min', '_max', '_diff', '_mean')]
+        columns += [f'quality_jaccard_{bits}' for bits in (64, 128, 256)]
+        columns += [
+            f'kmer_{k}_hashjaccard_{bits}'
+            for k in (3, 5)
+            for bits in (64, 128, 256, 512)
+        ]
+        pd.DataFrame(columns=columns).to_csv(shard_output, index=False)
 
     print(f"Done. Wrote {rows_written} rows to {shard_output}.")
 
@@ -675,7 +682,7 @@ def merge_shards(
             f"Cannot merge: {len(missing)} shard file(s) not found.\n"
             f"  Missing shard IDs: {missing_ids}\n"
             f"  Missing paths: {missing}\n"
-            f"Check per-shard logs for errors (e.g. shard_{{i}}.log)."
+            f"Check per-shard logs for errors (e.g. {base}.shard_<id>.log)."
         )
 
     print(f"Merging {num_shards} shard(s) into {output_csv} ...")

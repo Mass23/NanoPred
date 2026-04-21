@@ -1,28 +1,73 @@
 """
-train_model.py - Train a pairwise regression ensemble to predict percent identity
+train_model.py - Train pairwise regression models to predict percent identity
 from sequence metrics.
 
-Adapts the pairwise ensemble approach from MACE-laboratory for regression tasks.
+Pipeline:
+  1. Reduced model (fast screen): GC/Length/Quality features only.
+     - Regressor thresholded as classifier at multiple cutoffs (0.85–0.99).
+     - Optimized for recall at 0.85.
+     - Saved as reduced_model.pkl.
+
+  2. Full model (weighted regression):
+     - Sample weights: (y_true / 100)^2  (y_true normalised to [0,1] first).
+     - Separate model suites for each k-mer/hash configuration.
+     - Feature sets of size 5, 10, 20.
+     - Also 50 random feature sets per size.
+     - Reports R², MAE, RMSE globally and on the high-identity subset
+       (y_true ≥ 85.0, i.e. 85 % in [0–100] scale).
+
+Data scale note:
+  Throughout this script, `y` is in [0, 100] (percent identity).
+  The "high identity" threshold is HIGH_THRESHOLD = 85.0 (not 0.85).
+  Classifier thresholds are likewise expressed in [0, 100].
+  Sample weights are (y / 100)^2 so that each weight is in [0, 1].
 
 Usage:
-    python train_model.py --input all_pairs_data.csv --output-dir models/ \
+    python train_model.py --input all_pairs_data.csv --output-dir models/ \\
         [--results results.csv] [--seed 23]
 """
 
 import argparse
 import os
+import random as rnd
 
 import joblib
 import numpy as np
 import pandas as pd
 from scipy.stats import pearsonr, spearmanr
 from sklearn.base import clone
-from sklearn.linear_model import ElasticNet, LinearRegression, Ridge
+from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import KFold
-from sklearn.neural_network import MLPRegressor
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    confusion_matrix,
+)
 from sklearn.preprocessing import StandardScaler
+
+
+# =========================================================
+# CONSTANTS
+# =========================================================
+
+# y is in [0, 100].  "High identity" is ≥ 85 %.
+HIGH_THRESHOLD = 85.0
+
+# Thresholds for classifier-style stats on the reduced model (same scale).
+CLASSIFIER_THRESHOLDS = [85.0, 90.0, 95.0, 97.0, 99.0]
+
+# Feature set sizes to test for the full model.
+FULL_MODEL_FEATURE_SIZES = [5, 10, 20]
+
+# Number of random feature sets generated per (kmer_config, size) combination.
+N_RANDOM_FEATURE_SETS = 50
+
+# Feature group prefixes used throughout for quota enforcement.
+GC_PREFIX      = "gc"
+LENGTH_PREFIX  = "length"
+QUALITY_PREFIX = "quality"
+KMER_PREFIX    = "kmer"
 
 
 # =========================================================
@@ -31,27 +76,24 @@ from sklearn.preprocessing import StandardScaler
 
 def load_and_prepare_data(csv_path: str) -> tuple:
     """
-    Load all_pairs_data.csv, apply length filtering and remove missing values.
+    Load all_pairs_data.csv, apply length filtering and drop missing values.
 
-    Filtering rules (applied per pair row):
-    - Discard rows where length_min < 900  (i.e. the shorter sequence is < 900 bp)
-    - Discard rows where length_max > 2500 (i.e. the longer sequence is > 2500 bp)
+    Filtering:
+    - Keep rows where 900 ≤ length_min and length_max ≤ 3000.
 
     Returns:
-        (X, y) where X is a DataFrame of all numeric features and
-        y is a Series of real_percent_identity values.
+        (X, y) where X is a DataFrame of numeric features and
+        y is a Series of real_percent_identity values in [0, 100].
     """
     print(f"Loading data from {csv_path} ...")
     df = pd.read_csv(csv_path)
     print(f"  Loaded {len(df):,} rows, {df.shape[1]} columns.")
 
-    # Length filtering
     before = len(df)
     df = df[(df['length_min'] >= 900) & (df['length_max'] <= 3000)]
     print(f"  After length filter (900–3000 bp): {len(df):,} rows "
           f"(removed {before - len(df):,}).")
 
-    # Drop missing values
     before = len(df)
     df = df.dropna()
     print(f"  After dropping NAs: {len(df):,} rows (removed {before - len(df):,}).")
@@ -65,7 +107,6 @@ def load_and_prepare_data(csv_path: str) -> tuple:
 
     y = df[target]
 
-    # Use ALL numeric columns except the target as features
     numeric_cols = df.select_dtypes(include='number').columns.tolist()
     feature_cols = [c for c in numeric_cols if c != target]
     X = df[feature_cols]
@@ -84,59 +125,73 @@ def expand_features(X: pd.DataFrame) -> pd.DataFrame:
     Create log and sqrt versions of all numeric features.
 
     For each original column `col`:
-      - log version (`col__log`):  np.log1p(x) — handles zeros automatically.
-      - sqrt version (`col__sqrt`): np.sqrt(np.abs(x)) * np.sign(x) — handles negatives.
+      - log version  (`col__log`):  np.log1p(x)
+      - sqrt version (`col__sqrt`): np.sqrt(|x|) * sign(x)
 
-    Returns a new DataFrame with original + log + sqrt columns (3x feature count).
+    Returns a new DataFrame with original + log + sqrt columns (3× count).
     """
     parts = [X]
     for col in X.columns:
         vals = X[col].values.astype(float)
-
-        log_vals = np.log1p(vals)
+        log_vals  = np.log1p(vals)
         sqrt_vals = np.sqrt(np.abs(vals)) * np.sign(vals)
-
         parts.append(pd.Series(log_vals,  index=X.index, name=f"{col}__log"))
         parts.append(pd.Series(sqrt_vals, index=X.index, name=f"{col}__sqrt"))
-
     return pd.concat(parts, axis=1)
+
+
+# =========================================================
+# FEATURE HELPERS
+# =========================================================
+
+def base_name(col: str) -> str:
+    """Strip __log / __sqrt suffix to recover the base feature name."""
+    if col.endswith("__log"):
+        return col[:-5]
+    if col.endswith("__sqrt"):
+        return col[:-6]
+    return col
+
+
+def get_feature_prefix(b: str) -> str:
+    """Return the group prefix of a base feature name (gc/length/quality/kmer/other)."""
+    for prefix in [GC_PREFIX, LENGTH_PREFIX, QUALITY_PREFIX, KMER_PREFIX]:
+        if b == prefix or b.startswith(prefix + "_"):
+            return prefix
+    return "other"
+
+
+def build_base_to_col(cols) -> dict:
+    """Map each base feature name to the list of its available transform columns."""
+    mapping = {}
+    for c in cols:
+        b = base_name(c)
+        mapping.setdefault(b, []).append(c)
+    return mapping
 
 
 # =========================================================
 # FEATURE SELECTION
 # =========================================================
 
-def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -> list:
+def _compute_avg_rank(X: pd.DataFrame, y: pd.Series, seed: int = 0):
     """
-    Select the top-n features using a combined ranking of three metrics:
-      1. |Spearman correlation| with target
-      2. |Pearson correlation| with target
-      3. RandomForest feature importance (trained on X, y)
+    Compute combined average rank for every column in X using:
+      1. |Spearman correlation| with y
+      2. |Pearson correlation|  with y
+      3. RandomForest feature importance
 
-    Change vs previous:
-      - Features are expanded into base/log/sqrt variants (handled upstream).
-      - This selector now enforces that for each *base feature* we keep ONLY the
-        best-performing transform among:
-            base, base__log, base__sqrt
-        so top-N contains unique base features (no triple-counting).
+    Also collapses transforms: for each base feature, keeps only the column
+    with the best (lowest) avg_rank.
 
-    NEW: Enforce group quotas by prefix on the chosen base-feature winners:
-      - length: 1
-      - gc: 1
-      - dna: 1
-      - quality: 2
-      - kmer: 2
-    (Total = 7). For n > 7, fill remaining slots by best overall combined rank.
-
-    All computations use only the data passed in (no leakage when called on
-    training data exclusively).
+    Returns:
+        (best_col_for_base, best_rank_for_base)
+        where keys are base feature names.
     """
-    cols = X.columns.tolist()
+    cols   = X.columns.tolist()
     y_vals = y.values
 
-    # ---------- score each (possibly-transformed) column ----------
-    spearman_scores = []
-    pearson_scores = []
+    spearman_scores, pearson_scores = [], []
     for col in cols:
         vals = X[col].values
         if np.std(vals) == 0:
@@ -153,67 +208,87 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
     rf_scores = list(rf.feature_importances_)
 
     def to_rank(scores: list) -> np.ndarray:
-        """Rank scores so that the highest score gets rank 1."""
-        arr = np.array(scores, dtype=float)
-        order = np.argsort(-arr)  # descending sort → best first
+        arr   = np.array(scores, dtype=float)
+        order = np.argsort(-arr)
         ranks = np.empty_like(order)
         ranks[order] = np.arange(1, len(arr) + 1)
         return ranks
 
-    ranks_sp = to_rank(spearman_scores)
-    ranks_pe = to_rank(pearson_scores)
-    ranks_rf = to_rank(rf_scores)
-    avg_rank = (ranks_sp + ranks_pe + ranks_rf) / 3.0
+    avg_rank = (to_rank(spearman_scores) + to_rank(pearson_scores) + to_rank(rf_scores)) / 3.0
 
-    # ---------- collapse transforms: choose best per base feature ----------
-    def base_name(col: str) -> str:
-        # expand_features() uses "__log" and "__sqrt"
-        if col.endswith("__log"):
-            return col[:-5]
-        if col.endswith("__sqrt"):
-            return col[:-6]
-        return col
-
-    # For each base feature, pick the transform column with lowest avg_rank (best)
-    best_col_for_base = {}   # base -> chosen col
-    best_rank_for_base = {}  # base -> chosen rank
+    best_col_for_base  = {}
+    best_rank_for_base = {}
     for c, r in zip(cols, avg_rank):
         b = base_name(c)
         if (b not in best_rank_for_base) or (r < best_rank_for_base[b]):
             best_rank_for_base[b] = float(r)
-            best_col_for_base[b] = c
+            best_col_for_base[b]  = c
 
-    # Overall ranking of base features (best avg_rank first), but return chosen cols
-    ranked_bases = [b for b, _ in sorted(best_rank_for_base.items(), key=lambda x: x[1])]
-    ranked_cols = [best_col_for_base[b] for b in ranked_bases]
+    return best_col_for_base, best_rank_for_base
 
-    # ---------- group quota enforcement on base features ----------
-    quotas = {
-        "length": 1,
-        "gc": 1,
-        "dna": 1,
-        "quality": 2,
-        "kmer": 2,
-    }
 
-    def in_group_base(b: str, prefix: str) -> bool:
-        # Match exact prefix or prefix_... (covers "length_min" and "length")
-        return b == prefix or b.startswith(prefix + "_")
+def select_topn_combined(
+    X: pd.DataFrame,
+    y: pd.Series,
+    n: int,
+    seed: int = 0,
+    quotas: dict = None,
+    allowed_prefixes: list = None,
+) -> list:
+    """
+    Select the top-n features using a combined ranking approach.
 
-    selected_bases = []
+    For each base feature, only the best-performing transform is kept
+    (among base, base__log, base__sqrt).
 
-    # 1) take quota features from each group, using base ranking order
+    Args:
+        n:                Number of features to select.
+        quotas:           Dict mapping group prefix → minimum count guaranteed
+                          in the result.  E.g. {"gc": 1, "length": 1, "kmer": 1}.
+        allowed_prefixes: If given, restrict candidate base features to those
+                          whose prefix is in this list (used for reduced model).
+
+    Returns:
+        List of chosen column names (length ≤ n).
+    """
+    if allowed_prefixes is not None:
+        cols_to_use = [
+            c for c in X.columns
+            if get_feature_prefix(base_name(c)) in allowed_prefixes
+        ]
+        if not cols_to_use:
+            return []
+        X = X[cols_to_use]
+
+    if X.shape[1] == 0:
+        return []
+
+    best_col_for_base, best_rank_for_base = _compute_avg_rank(X, y, seed=seed)
+
+    # Bases sorted from best to worst rank
+    ranked_bases = [
+        b for b, _ in sorted(best_rank_for_base.items(), key=lambda kv: kv[1])
+    ]
+
+    if quotas is None:
+        quotas = {}
+
+    selected_bases: list = []
+    seen: set = set()
+
+    # 1) Guarantee quota features for each group
     for prefix, q in quotas.items():
         if q <= 0:
             continue
-        group_bases = [b for b in ranked_bases if in_group_base(b, prefix)]
-        selected_bases.extend(group_bases[:q])
+        group_bases = [
+            b for b in ranked_bases
+            if get_feature_prefix(b) == prefix and b not in seen
+        ]
+        for b in group_bases[:q]:
+            selected_bases.append(b)
+            seen.add(b)
 
-    # de-dup while preserving order
-    seen = set()
-    selected_bases = [b for b in selected_bases if not (b in seen or seen.add(b))]
-
-    # 2) backfill to reach n from global base ranking
+    # 2) Back-fill to reach n from global ranking
     for b in ranked_bases:
         if len(selected_bases) >= n:
             break
@@ -221,9 +296,8 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
             selected_bases.append(b)
             seen.add(b)
 
-    # Return the chosen transform column for each selected base
-    selected_cols = [best_col_for_base[b] for b in selected_bases[:n]]
-    return selected_cols
+    return [best_col_for_base[b] for b in selected_bases[:n]]
+
 
 # =========================================================
 # BASE REGRESSORS
@@ -231,290 +305,582 @@ def select_topn_combined(X: pd.DataFrame, y: pd.Series, n: int, seed: int = 0) -
 
 def get_base_regressors(seed: int = 23) -> list:
     """
-    Define all base regression models for the ensemble.
+    Return the list of (name, model) base regressors.
 
-    Args:
-        seed: Random seed for reproducibility (used for all stochastic models).
-
-    Returns:
-        List of (name, model) tuples.
+    Excluded: MLPRegressor, ElasticNet, ensemble meta-learner.
     """
     return [
         # Linear models
         ("LinearRegression", LinearRegression()),
-        ("Ridge_a1e-1",    Ridge(alpha=1e-1)),
-        ("Ridge_a1",       Ridge(alpha=1.0)),
-        ("Ridge_a10",      Ridge(alpha=10.0)),
-        ("ElasticNet_l1_05", ElasticNet(alpha=1e-2, l1_ratio=0.5, max_iter=1000, random_state=seed)),
-        ("ElasticNet_l1_08", ElasticNet(alpha=1e-2, l1_ratio=0.8, max_iter=1000, random_state=seed)),
+        ("Ridge_a1e-1",      Ridge(alpha=1e-1)),
+        ("Ridge_a1",         Ridge(alpha=1.0)),
+        ("Ridge_a10",        Ridge(alpha=10.0)),
 
         # Random Forest
-        ("RF_md4",   RandomForestRegressor(n_estimators=100, max_depth=4,  random_state=seed, n_jobs=-1)),
-        ("RF_md8",   RandomForestRegressor(n_estimators=200, max_depth=8,  random_state=seed, n_jobs=-1)),
-        ("RF_md12",  RandomForestRegressor(n_estimators=300, max_depth=12, random_state=seed, n_jobs=-1)),
-        ("RF_md16",  RandomForestRegressor(n_estimators=400, max_depth=16, random_state=seed, n_jobs=-1)),
-
-        # Neural networks
-        ("MLP_50_l2",       MLPRegressor(hidden_layer_sizes=(50,),       alpha=1e-2, max_iter=500, random_state=seed)),
-        ("MLP_100_nopen",   MLPRegressor(hidden_layer_sizes=(100,),      alpha=0.0,  max_iter=500, random_state=seed)),
-        ("MLP_5050_l2",     MLPRegressor(hidden_layer_sizes=(50, 50),    alpha=1e-2, max_iter=500, random_state=seed)),
-        ("MLP_100100_l2",   MLPRegressor(hidden_layer_sizes=(100, 100),  alpha=1e-2, max_iter=500, random_state=seed)),
+        ("RF_md4",  RandomForestRegressor(n_estimators=100, max_depth=4,
+                                          random_state=seed, n_jobs=-1)),
+        ("RF_md8",  RandomForestRegressor(n_estimators=200, max_depth=8,
+                                          random_state=seed, n_jobs=-1)),
+        ("RF_md12", RandomForestRegressor(n_estimators=300, max_depth=12,
+                                          random_state=seed, n_jobs=-1)),
 
         # Gradient Boosting
-        ("GBR_d3_lr01",  GradientBoostingRegressor(n_estimators=200, max_depth=3,  learning_rate=0.1,  random_state=seed)),
-        ("GBR_d5_lr01",  GradientBoostingRegressor(n_estimators=200, max_depth=5,  learning_rate=0.1,  random_state=seed)),
-        ("GBR_d3_lr005", GradientBoostingRegressor(n_estimators=300, max_depth=3,  learning_rate=0.05, random_state=seed)),
+        ("GBR_d3_lr01",  GradientBoostingRegressor(n_estimators=200, max_depth=3,
+                                                   learning_rate=0.10, random_state=seed)),
+        ("GBR_d5_lr01",  GradientBoostingRegressor(n_estimators=200, max_depth=5,
+                                                   learning_rate=0.10, random_state=seed)),
+        ("GBR_d3_lr005", GradientBoostingRegressor(n_estimators=300, max_depth=3,
+                                                   learning_rate=0.05, random_state=seed)),
     ]
 
 
 # =========================================================
-# MODEL EVALUATION WITH RANDOM SUBSAMPLING
+# REDUCED MODEL  (GC / Length / Quality only)
 # =========================================================
 
-def evaluate_models_on_feature_set(
-    base_models: list,
+def compute_classifier_stats(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    threshold: float,
+) -> dict:
+    """
+    Treat the regression output as a binary classifier at `threshold`.
+
+    Positive class  = y ≥ threshold  (high-identity pairs).
+    Negative class  = y <  threshold.
+
+    y_true and y_pred are expected in [0, 100] (percent identity scale).
+
+    Returns dict with: threshold, tp, fp, tn, fn, recall, precision, f1.
+    """
+    y_bin_true = (y_true >= threshold).astype(int)
+    y_bin_pred = (y_pred >= threshold).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(y_bin_true, y_bin_pred, labels=[0, 1]).ravel()
+
+    recall    = tp / (tp + fn)           if (tp + fn) > 0           else 0.0
+    precision = tp / (tp + fp)           if (tp + fp) > 0           else 0.0
+    f1        = (2 * precision * recall
+                 / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+    return {
+        'threshold': threshold,
+        'tp':        int(tp),
+        'fp':        int(fp),
+        'tn':        int(tn),
+        'fn':        int(fn),
+        'recall':    recall,
+        'precision': precision,
+        'f1':        f1,
+    }
+
+
+def train_reduced_model(
     X_train: pd.DataFrame,
     y_train: pd.Series,
-    n_features: int,
-    feature_sets: dict,
-    seed: int = 23,
-    n_repeats: int = 3,
-    subsample_size: int = 30_000,
-    subsample_train: int = 25_000,
-) -> list:
-    """
-    Evaluate all base models on a specific feature set using n_repeats random
-    subsamples drawn from X_train.
-
-    Each repeat:
-      1. Draw subsample_size rows at random (without replacement, or all rows if
-         fewer are available).
-      2. Use the first subsample_train rows as a mini-train set and the
-         remainder as a mini-validation set.
-
-    This gives n_repeats R² scores per model whose mean is used for ranking.
-
-    Returns:
-        List of (name, model, n_features, mean_cv_r2) tuples.
-    """
-    features = feature_sets[n_features]
-    X_sel = X_train[features]
-    n_available = len(X_sel)
-
-    # Clamp sample sizes to what is actually available
-    effective_sample = min(subsample_size, n_available)
-    effective_train  = min(subsample_train, effective_sample - 1)
-
-    model_results = []
-
-    print(f"  Evaluating base models for top {n_features} features "
-          f"({n_repeats} random subsamples, "
-          f"train={effective_train:,} / val={effective_sample - effective_train:,}):")
-    for name, model in base_models:
-        scores = []
-        for repeat in range(n_repeats):
-            rng = np.random.default_rng(seed + repeat)
-            sample_idx = rng.choice(n_available, size=effective_sample, replace=False)
-            tr_idx  = sample_idx[:effective_train]
-            val_idx = sample_idx[effective_train:]
-
-            X_tr  = X_sel.iloc[tr_idx]
-            X_val = X_sel.iloc[val_idx]
-            y_tr  = y_train.iloc[tr_idx]
-            y_val = y_train.iloc[val_idx]
-
-            m = clone(model)
-            m.fit(X_tr, y_tr)
-            y_pred = m.predict(X_val)
-            scores.append(r2_score(y_val, y_pred))
-
-        mean_r2 = float(np.mean(scores))
-        print(f"    {name:25s} mean R² = {mean_r2:.4f}")
-        model_results.append((name, model, n_features, mean_r2))
-
-    return model_results
-
-
-# =========================================================
-# ENSEMBLE TRAINING AND EVALUATION
-# =========================================================
-
-def train_and_evaluate_ensemble(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_test: pd.DataFrame,
-    y_test: pd.Series,
-    feature_sets: dict,
+    X_test:  pd.DataFrame,
+    y_test:  pd.Series,
     base_models: list,
-    top_k: int = 5,
     seed: int = 23,
 ) -> dict:
     """
-    Train base models on all feature sets, select top-k by mean R² from random
-    subsamples, then combine their predictions with a Ridge meta-learner
-    (penalised regression ensemble).
+    Train and evaluate reduced models using only GC / Length / Quality features.
+
+    Steps:
+      1. Restrict candidate features to gc/length/quality prefixes.
+      2. Select top-10 features via combined ranking (with minimum 1 per group).
+      3. For each base model:
+         - Train on the training set (no sample weights for reduced model).
+         - Evaluate on the test set.
+         - Compute classifier-style stats at thresholds 85, 90, 95, 97, 99.
+      4. Select the best model: maximise recall@85, tie-break by precision@85.
 
     Returns:
-        dict with trained_models, meta_learner, ensemble_metadata, and metrics.
+        dict with best_model, best_model_name, features, best_stats,
+        all_model_stats.  Empty dict if no suitable features found.
     """
-    # ----- Step 1: evaluate all base models on each feature set -----
-    all_model_results = []
-    for n_features in [7, 9, 14, 21, 31]:
-        all_model_results.extend(
-            evaluate_models_on_feature_set(
-                base_models, X_train, y_train, n_features, feature_sets,
-                seed=seed, n_repeats=3,
-            )
-        )
+    print("\n--- REDUCED MODEL (GC / Length / Quality only) ---")
 
-    # ----- Step 2: select top-k models -----
-    sorted_results = sorted(all_model_results, key=lambda x: x[3], reverse=True)
-    top_results = sorted_results[:top_k]
+    REDUCED_PREFIXES = [GC_PREFIX, LENGTH_PREFIX, QUALITY_PREFIX]
+    REDUCED_QUOTAS   = {GC_PREFIX: 1, LENGTH_PREFIX: 1, QUALITY_PREFIX: 1}
+    N_REDUCED_FEATS  = 10
 
-    print(f"\n  Top {top_k} models selected:")
-    for name, _, n_feat, mean_r2 in top_results:
-        print(f"    {name:25s} (top {n_feat:2d} feats)  mean R² = {mean_r2:.4f}")
+    print(f"  Selecting top {N_REDUCED_FEATS} GC/Length/Quality features...")
+    reduced_features = select_topn_combined(
+        X_train, y_train, N_REDUCED_FEATS,
+        seed=seed,
+        quotas=REDUCED_QUOTAS,
+        allowed_prefixes=REDUCED_PREFIXES,
+    )
 
-    # ----- Step 3: train top-k models on FULL training set -----
-    # Also collect out-of-fold predictions for meta-learner training
-    kf = KFold(n_splits=3, shuffle=True, random_state=seed)
+    if not reduced_features:
+        print("  WARNING: No GC/Length/Quality features found. Skipping reduced model.")
+        return {}
 
-    # Build OOF matrix: rows = train samples, cols = top-k base models
-    oof_preds = np.zeros((len(X_train), top_k))
-    for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(X_train)):
-        for m_idx, (name, model, n_feat, _) in enumerate(top_results):
-            feats = feature_sets[n_feat]
-            X_tr  = X_train.iloc[tr_idx][feats]
-            X_val = X_train.iloc[val_idx][feats]
-            y_tr  = y_train.iloc[tr_idx]
+    print(f"  Selected features: {reduced_features}")
 
-            m = clone(model)
-            m.fit(X_tr, y_tr)
-            oof_preds[val_idx, m_idx] = m.predict(X_val)
+    X_tr_r = X_train[reduced_features]
+    X_te_r = X_test[reduced_features]
+    y_tr   = y_train.values
+    y_te   = y_test.values
 
-    # Train meta-learner on OOF predictions
-    meta_scaler = StandardScaler()
-    oof_scaled = meta_scaler.fit_transform(oof_preds)
-    meta_learner = MLPRegressor(hidden_layer_sizes=(50, 25), max_iter=1000)
-    meta_learner.fit(oof_scaled, y_train)
+    model_stats = []
 
-    # Train final base models on full training set
-    trained_models = []
-    test_base_preds = np.zeros((len(X_test), top_k))
-    test_results_per_model = []
-
-    for m_idx, (name, model, n_feat, cv_r2) in enumerate(top_results):
-        feats = feature_sets[n_feat]
+    for name, model in base_models:
         m = clone(model)
-        m.fit(X_train[feats], y_train)
-        trained_models.append((name, m, n_feat, feats))
+        m.fit(X_tr_r, y_tr)
+        y_pred = m.predict(X_te_r)
 
-        # Individual test-set evaluation
-        y_test_pred = m.predict(X_test[feats])
-        test_base_preds[:, m_idx] = y_test_pred
+        test_r2   = r2_score(y_te, y_pred)
+        test_mae  = mean_absolute_error(y_te, y_pred)
+        test_rmse = float(np.sqrt(mean_squared_error(y_te, y_pred)))
 
-        test_r2  = r2_score(y_test, y_test_pred)
-        test_mae = mean_absolute_error(y_test, y_test_pred)
-        test_rmse = float(np.sqrt(mean_squared_error(y_test, y_test_pred)))
-        test_results_per_model.append({
-            'model_name': name,
-            'n_features': n_feat,
-            'cv_r2': cv_r2,
-            'test_r2': test_r2,
-            'test_mae': test_mae,
-            'test_rmse': test_rmse,
+        thresh_stats = [
+            compute_classifier_stats(y_te, y_pred, t)
+            for t in CLASSIFIER_THRESHOLDS
+        ]
+        stats_85 = thresh_stats[0]   # first threshold is 85.0
+
+        print(f"  [{name}] R²={test_r2:.4f} | "
+              f"recall@85={stats_85['recall']:.4f}  "
+              f"prec@85={stats_85['precision']:.4f}  "
+              f"f1@85={stats_85['f1']:.4f}")
+
+        model_stats.append({
+            'model_name':  name,
+            'model':       m,
+            'features':    reduced_features,
+            'test_r2':     test_r2,
+            'test_mae':    test_mae,
+            'test_rmse':   test_rmse,
+            'thresh_stats': thresh_stats,
+            'recall_85':   stats_85['recall'],
+            'precision_85': stats_85['precision'],
+            'f1_85':       stats_85['f1'],
         })
 
-    # ----- Step 4: ensemble prediction -----
-    test_base_scaled = meta_scaler.transform(test_base_preds)
-    y_ensemble = meta_learner.predict(test_base_scaled)
-
-    ensemble_r2   = r2_score(y_test, y_ensemble)
-    ensemble_mae  = mean_absolute_error(y_test, y_ensemble)
-    ensemble_rmse = float(np.sqrt(mean_squared_error(y_test, y_ensemble)))
-
-    print(f"\n  Ensemble (Ridge meta-learner):")
-    print(f"    R²   = {ensemble_r2:.4f}")
-    print(f"    MAE  = {ensemble_mae:.4f}")
-    print(f"    RMSE = {ensemble_rmse:.4f}")
+    best = max(model_stats, key=lambda x: (x['recall_85'], x['precision_85']))
+    print(f"\n  Best reduced model: {best['model_name']} "
+          f"(recall@85={best['recall_85']:.4f}, "
+          f"prec@85={best['precision_85']:.4f})")
 
     return {
-        'trained_models': trained_models,
-        'meta_learner': meta_learner,
-        'meta_scaler': meta_scaler,
-        'test_results_per_model': test_results_per_model,
-        'ensemble_metrics': {
-            'r2': ensemble_r2,
-            'mae': ensemble_mae,
-            'rmse': ensemble_rmse,
-        },
-        'top_results': [(name, n_feat, cv_r2) for name, _, n_feat, cv_r2 in top_results],
+        'best_model':      best['model'],
+        'best_model_name': best['model_name'],
+        'features':        reduced_features,
+        'best_stats':      best,
+        'all_model_stats': model_stats,
     }
 
 
 # =========================================================
-# SAVING MODELS AND RESULTS
+# FULL MODEL  –  K-mer experiment helpers
 # =========================================================
 
-def save_models(output_dir: str, result: dict, feature_scaler: StandardScaler = None) -> None:
+def detect_kmer_configs(X: pd.DataFrame) -> list:
     """
-    Save trained base models, feature sets, and ensemble metadata to disk.
+    Detect kmer/hash configuration columns from the expanded feature DataFrame.
 
-    Layout:
-        output_dir/
-            <ModelName>_top<N>.pkl          – trained base model
-            <ModelName>_top<N>_features.pkl – list of selected feature names
-            feature_scaler.pkl              – StandardScaler fit on training features
-            ensemble_metadata.pkl           – which models/features used + weights
+    A kmer configuration is a unique base feature name that starts with "kmer_",
+    e.g. "kmer_3_hashjaccard_64".  All three transforms (base, __log, __sqrt) of
+    each configuration are grouped together.
+
+    Returns:
+        Sorted list of (config_name, [col1, col2, ...]) tuples.
     """
+    kmer_cols: dict = {}
+    for col in X.columns:
+        b = base_name(col)
+        if b.startswith(KMER_PREFIX + "_"):
+            kmer_cols.setdefault(b, []).append(col)
+
+    configs = sorted(kmer_cols.items())
+    names   = [c for c, _ in configs]
+    print(f"  Detected {len(configs)} kmer configuration(s): {names}")
+    return configs
+
+
+def get_non_kmer_columns(X: pd.DataFrame) -> list:
+    """Return all column names whose base feature is NOT a kmer feature."""
+    return [c for c in X.columns if get_feature_prefix(base_name(c)) != KMER_PREFIX]
+
+
+def compute_high_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    threshold: float = HIGH_THRESHOLD,
+) -> dict:
+    """
+    Compute R², MAE, RMSE on the high-identity subset (y_true ≥ threshold).
+
+    Returns NaN values when no samples meet the threshold.
+    """
+    mask = y_true >= threshold
+    if mask.sum() == 0:
+        return {'r2_high': float('nan'), 'mae_high': float('nan'), 'rmse_high': float('nan')}
+    y_t = y_true[mask]
+    y_p = y_pred[mask]
+    return {
+        'r2_high':   r2_score(y_t, y_p),
+        'mae_high':  mean_absolute_error(y_t, y_p),
+        'rmse_high': float(np.sqrt(mean_squared_error(y_t, y_p))),
+    }
+
+
+def generate_random_feature_sets(
+    all_base_features: list,
+    base_to_col: dict,
+    n_features: int,
+    n_sets: int = N_RANDOM_FEATURE_SETS,
+    seed: int = 42,
+    required_prefixes: list = None,
+) -> list:
+    """
+    Generate random feature sets of size `n_features` that respect group quotas.
+
+    Each set guarantees:
+      - At least 1 feature from each prefix in `required_prefixes`.
+      - Only one transform (base / __log / __sqrt) per base feature.
+
+    Args:
+        all_base_features: All available base feature names.
+        base_to_col:       Mapping base feature → list of available transform columns.
+        n_features:        Desired number of features per set.
+        n_sets:            Number of random sets to generate.
+        seed:              RNG seed.
+        required_prefixes: Group prefixes that must appear at least once.
+
+    Returns:
+        List of feature-column lists (each list has ≤ n_features entries).
+    """
+    if required_prefixes is None:
+        required_prefixes = [GC_PREFIX, LENGTH_PREFIX, QUALITY_PREFIX, KMER_PREFIX]
+
+    by_prefix: dict = {}
+    other_bases: list = []
+    for b in all_base_features:
+        p = get_feature_prefix(b)
+        if p in required_prefixes:
+            by_prefix.setdefault(p, []).append(b)
+        else:
+            other_bases.append(b)
+
+    min_slots = len(required_prefixes)
+    if n_features < min_slots:
+        print(f"  WARNING: n_features={n_features} < min required slots={min_slots}. "
+              "Skipping random feature sets for this size.")
+        return []
+
+    # Check all required groups have at least one feature
+    missing = [p for p in required_prefixes if not by_prefix.get(p)]
+    if missing:
+        print(f"  WARNING: No features for group(s) {missing}. "
+              "Skipping random feature sets.")
+        return []
+
+    # Allow up to 30× retries per desired set to handle duplicate-base edge cases.
+    _MAX_RETRY_MULTIPLIER = 30
+    rng = rnd.Random(seed)
+    result_sets: list = []
+    attempts = 0
+    max_attempts = n_sets * _MAX_RETRY_MULTIPLIER
+
+    while len(result_sets) < n_sets and attempts < max_attempts:
+        attempts += 1
+
+        # Mandatory: one from each required group
+        chosen_bases: list = []
+        for prefix in required_prefixes:
+            chosen_bases.append(rng.choice(by_prefix[prefix]))
+
+        # Remove duplicates while preserving insertion order (rare but possible if a
+        # base feature satisfies more than one required prefix).
+        chosen_bases = list(dict.fromkeys(chosen_bases))
+
+        remaining_slots = n_features - len(chosen_bases)
+        pool = [b for b in all_base_features if b not in set(chosen_bases)]
+
+        if remaining_slots > len(pool):
+            extra = pool[:]
+        elif remaining_slots > 0:
+            extra = rng.sample(pool, remaining_slots)
+        else:
+            extra = []
+
+        chosen_bases.extend(extra)
+
+        # For each base feature, randomly pick one transform column.
+        # Skip bases with no mapped columns (should not happen with well-formed data).
+        chosen_cols = []
+        for b in chosen_bases:
+            transforms = base_to_col.get(b, [])
+            if not transforms:
+                continue
+            chosen_cols.append(rng.choice(transforms))
+        result_sets.append(chosen_cols)
+
+    return result_sets
+
+
+# =========================================================
+# FULL MODEL TRAINING
+# =========================================================
+
+def train_full_models(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test:  pd.DataFrame,
+    y_test:  pd.Series,
+    base_models: list,
+    seed: int = 23,
+) -> list:
+    """
+    Train weighted regression models for every kmer configuration.
+
+    Sample weights:
+        Each training sample is weighted by ``(y_true / 100) ** 2``.
+        This up-weights high-identity pairs (y close to 100) while keeping
+        all samples in the fit.  The factor (y/100) normalises to [0,1]
+        before squaring, so weights are always in [0, 1].
+
+    For each kmer configuration:
+      - Candidate features = all non-kmer columns + this kmer config's columns.
+      - Feature selection (sizes 5, 10, 20) with quotas:
+            ≥1 gc, ≥1 length, ≥1 quality, ≥1 kmer.
+      - Each base model is trained with sample weights and evaluated on test set:
+            global R², MAE, RMSE
+            high-only R²_high, MAE_high, RMSE_high  (y_true ≥ 85.0)
+
+    Additionally, for each (kmer_config, size), 50 random feature sets are
+    generated and evaluated with all base models.
+
+    Note on result dicts:
+        ``result['model']`` is ``None`` for random feature-set experiments —
+        only the metrics are stored for those runs.  Top-N models have their
+        fitted model object available for saving.
+
+    Returns:
+        List of result dicts (one per model × feature_set combination).
+    """
+    print("\n--- FULL MODEL EXPERIMENTS ---")
+
+    # Sample weights (training only); y in [0,100] → weight in [0,1]
+    # Quadratically up-weight high-identity pairs so that the model is sensitive
+    # to errors at the top of the identity range.  y/100 maps to [0,1]; squaring
+    # amplifies the weight for values close to 1 while keeping all samples in fit.
+    sample_weights = (y_train.values / 100.0) ** 2
+
+    y_tr = y_train.values
+    y_te = y_test.values
+
+    kmer_configs  = detect_kmer_configs(X_train)
+    non_kmer_cols = get_non_kmer_columns(X_train)
+
+    if not kmer_configs:
+        print("  WARNING: No kmer features found; running a single configuration "
+              "with non-kmer features only (no kmer quota enforced).")
+        kmer_configs = [("no_kmer", [])]
+
+    full_quotas = {
+        GC_PREFIX:      1,
+        LENGTH_PREFIX:  1,
+        QUALITY_PREFIX: 1,
+        KMER_PREFIX:    1,
+    }
+
+    all_results: list = []
+
+    for kmer_config_name, kmer_col_list in kmer_configs:
+        print(f"\n  === K-mer config: {kmer_config_name} ===")
+
+        available_cols = non_kmer_cols + kmer_col_list
+        X_tr_sub = X_train[available_cols]
+        X_te_sub = X_test[available_cols]
+
+        # ----- Top-N feature sets -----
+        topn_feature_sets: dict = {}
+        for n_feat in FULL_MODEL_FEATURE_SIZES:
+            q = full_quotas if kmer_col_list else {
+                GC_PREFIX: 1, LENGTH_PREFIX: 1, QUALITY_PREFIX: 1
+            }
+            feats = select_topn_combined(
+                X_tr_sub, y_train, n_feat, seed=seed, quotas=q,
+            )
+            topn_feature_sets[n_feat] = feats
+            print(f"    Top {n_feat} features: {feats}")
+
+        for n_feat in FULL_MODEL_FEATURE_SIZES:
+            feats = topn_feature_sets.get(n_feat, [])
+            if not feats:
+                continue
+
+            X_tr_f = X_tr_sub[feats]
+            X_te_f = X_te_sub[feats]
+
+            for model_name, model in base_models:
+                m = clone(model)
+                try:
+                    m.fit(X_tr_f, y_tr, sample_weight=sample_weights)
+                except TypeError:
+                    m.fit(X_tr_f, y_tr)
+
+                y_pred = m.predict(X_te_f)
+
+                high = compute_high_metrics(y_te, y_pred)
+                all_results.append({
+                    'model_name':       model_name,
+                    'kmer_config':      kmer_config_name,
+                    'n_features':       n_feat,
+                    'feature_set_type': 'topN',
+                    'features':         feats,
+                    'model':            m,
+                    'test_r2':          r2_score(y_te, y_pred),
+                    'test_mae':         mean_absolute_error(y_te, y_pred),
+                    'test_rmse':        float(np.sqrt(mean_squared_error(y_te, y_pred))),
+                    **high,
+                })
+
+        # ----- Random feature sets -----
+        print(f"\n  Random feature sets for {kmer_config_name}...")
+
+        available_base_features = list({base_name(c) for c in available_cols})
+        local_base_to_col = build_base_to_col(available_cols)
+
+        req_pfx = (
+            [GC_PREFIX, LENGTH_PREFIX, QUALITY_PREFIX, KMER_PREFIX]
+            if kmer_col_list
+            else [GC_PREFIX, LENGTH_PREFIX, QUALITY_PREFIX]
+        )
+
+        for n_feat in FULL_MODEL_FEATURE_SIZES:
+            rand_sets = generate_random_feature_sets(
+                available_base_features,
+                local_base_to_col,
+                n_feat,
+                n_sets=N_RANDOM_FEATURE_SETS,
+                seed=seed + n_feat,
+                required_prefixes=req_pfx,
+            )
+
+            for set_idx, feats in enumerate(rand_sets):
+                # Guard: only use columns that actually exist in X_tr_sub
+                feats = [f for f in feats if f in X_tr_sub.columns]
+                if not feats:
+                    continue
+
+                X_tr_f = X_tr_sub[feats]
+                X_te_f = X_te_sub[feats]
+
+                for model_name, model in base_models:
+                    m = clone(model)
+                    try:
+                        m.fit(X_tr_f, y_tr, sample_weight=sample_weights)
+                    except TypeError:
+                        m.fit(X_tr_f, y_tr)
+
+                    y_pred = m.predict(X_te_f)
+
+                    high = compute_high_metrics(y_te, y_pred)
+                    all_results.append({
+                        'model_name':       model_name,
+                        'kmer_config':      kmer_config_name,
+                        'n_features':       n_feat,
+                        'feature_set_type': f'random_{set_idx:03d}',
+                        'features':         feats,
+                        'model':            None,   # random-set models are not persisted to disk
+                        'test_r2':          r2_score(y_te, y_pred),
+                        'test_mae':         mean_absolute_error(y_te, y_pred),
+                        'test_rmse':        float(np.sqrt(mean_squared_error(y_te, y_pred))),
+                        **high,
+                    })
+
+    return all_results
+
+
+# =========================================================
+# SAVING
+# =========================================================
+
+def save_reduced_model(
+    output_dir: str,
+    result: dict,
+    feature_scaler: StandardScaler = None,
+) -> None:
+    """Save the best reduced model and its feature list to output_dir."""
     os.makedirs(output_dir, exist_ok=True)
 
-    for name, model, n_feat, feats in result['trained_models']:
-        safe_name = name.replace(' ', '_')
-        model_path = os.path.join(output_dir, f"{safe_name}_top{n_feat}.pkl")
-        feats_path  = os.path.join(output_dir, f"{safe_name}_top{n_feat}_features.pkl")
-        joblib.dump(model, model_path)
-        joblib.dump(feats,  feats_path)
+    if not result:
+        print("  No reduced model to save (empty result).")
+        return
 
-    # Save feature scaler
+    model_path = os.path.join(output_dir, 'reduced_model.pkl')
+    feats_path = os.path.join(output_dir, 'reduced_model_features.pkl')
+
+    joblib.dump(result['best_model'], model_path)
+    joblib.dump(result['features'],   feats_path)
+
     if feature_scaler is not None:
         joblib.dump(feature_scaler, os.path.join(output_dir, 'feature_scaler.pkl'))
 
-    # Save meta-learner
-    joblib.dump(result['meta_learner'], os.path.join(output_dir, 'meta_learner.pkl'))
-    joblib.dump(result['meta_scaler'],  os.path.join(output_dir, 'meta_scaler.pkl'))
+    print(f"  ✓ Reduced model  → {model_path}")
+    print(f"  ✓ Reduced feats  → {feats_path}")
 
-    # Save ensemble metadata
-    ensemble_metadata = {
-        'models': [(name, n_feat) for name, _, n_feat, _ in result['trained_models']],
-        'ensemble_metrics': result['ensemble_metrics'],
-        'top_results': result['top_results'],
-    }
-    joblib.dump(ensemble_metadata, os.path.join(output_dir, 'ensemble_metadata.pkl'))
 
-    print(f"  ✓ Models saved to {output_dir}/")
+def save_full_models(
+    output_dir: str,
+    results: list,
+    feature_scaler: StandardScaler = None,
+) -> None:
+    """Save the top-10 full models (by R²_high) and a feature scaler."""
+    os.makedirs(output_dir, exist_ok=True)
 
-def save_results(results_path: str, result: dict) -> None:
-    """
-    Save per-model test results plus a final ensemble row to a CSV.
-    """
-    rows = list(result['test_results_per_model'])
+    if feature_scaler is not None:
+        joblib.dump(feature_scaler, os.path.join(output_dir, 'feature_scaler.pkl'))
 
-    # Add ensemble row
-    em = result['ensemble_metrics']
-    rows.append({
-        'model_name': 'Ensemble_Ridge',
-        'n_features': 'N/A',
-        'cv_r2': float('nan'),
-        'test_r2':  em['r2'],
-        'test_mae': em['mae'],
-        'test_rmse': em['rmse'],
-    })
+    valid = [r for r in results if not np.isnan(r.get('r2_high', float('nan')))]
+    sorted_results = sorted(valid, key=lambda x: x['r2_high'], reverse=True)
 
-    df = pd.DataFrame(rows, columns=['model_name', 'n_features', 'cv_r2',
-                                     'test_r2', 'test_mae', 'test_rmse'])
-    df.to_csv(results_path, index=False)
-    print(f"  ✓ Results saved to {results_path}")
+    for rank, res in enumerate(sorted_results[:10], 1):
+        if res.get('model') is None:
+            continue
+        safe_name  = res['model_name'].replace(' ', '_')
+        kmer_safe  = res['kmer_config'].replace(' ', '_')
+        n          = res['n_features']
+        model_path = os.path.join(
+            output_dir,
+            f"rank{rank:02d}_{safe_name}_{kmer_safe}_top{n}.pkl",
+        )
+        feats_path = model_path.replace('.pkl', '_features.pkl')
+        joblib.dump(res['model'],    model_path)
+        joblib.dump(res['features'], feats_path)
+        print(f"  ✓ Rank-{rank:02d}: {model_path}")
+
+    print(f"  ✓ Full model artifacts saved to {output_dir}/")
+
+
+def save_results_csv(
+    results_path: str,
+    full_results: list,
+    reduced_result: dict,
+) -> None:
+    """Save a flat CSV of all full-model results."""
+    rows = []
+    for res in full_results:
+        rows.append({
+            'model_name':       res['model_name'],
+            'kmer_config':      res['kmer_config'],
+            'n_features':       res['n_features'],
+            'feature_set_type': res['feature_set_type'],
+            'test_r2':          res['test_r2'],
+            'test_mae':         res['test_mae'],
+            'test_rmse':        res['test_rmse'],
+            'r2_high':          res.get('r2_high',   float('nan')),
+            'mae_high':         res.get('mae_high',  float('nan')),
+            'rmse_high':        res.get('rmse_high', float('nan')),
+        })
+
+    pd.DataFrame(rows).to_csv(results_path, index=False)
+    print(f"  ✓ Results CSV → {results_path}")
 
 
 # =========================================================
@@ -523,12 +889,12 @@ def save_results(results_path: str, result: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train a pairwise regression ensemble to predict percent identity."
+        description="Train pairwise regression models to predict percent identity."
     )
     parser.add_argument(
         '--input', '-i',
         default='all_pairs_data.csv',
-        help='Path to all_pairs_data.csv (default: all_pairs_data.csv).',
+        help='Path to all_pairs_data CSV (default: all_pairs_data.csv).',
     )
     parser.add_argument(
         '--output-dir', '-o',
@@ -544,13 +910,7 @@ def main() -> None:
         '--test-fraction',
         type=float,
         default=0.1,
-        help='Fraction of data to hold out for testing (default: 0.1).',
-    )
-    parser.add_argument(
-        '--top-k',
-        type=int,
-        default=10,
-        help='Number of top base models to include in the ensemble (default: 10).',
+        help='Fraction of data held out for testing (default: 0.1).',
     )
     parser.add_argument(
         '--seed',
@@ -561,17 +921,17 @@ def main() -> None:
     args = parser.parse_args()
 
     print("=" * 70)
-    print("PAIRWISE REGRESSION ENSEMBLE TRAINING")
+    print("PAIRWISE REGRESSION MODEL TRAINING")
     print("=" * 70)
 
     # ------------------------------------------------------------------
-    # 1. Load and prepare data
+    # 1. Load data
     # ------------------------------------------------------------------
     print("\n1. Loading and preparing data...")
     X, y = load_and_prepare_data(args.input)
 
     # ------------------------------------------------------------------
-    # 1b. Feature expansion (log + sqrt variants)
+    # 1b. Expand features (log + sqrt variants)
     # ------------------------------------------------------------------
     print("\n1b. Expanding features (log and sqrt variants)...")
     X = expand_features(X)
@@ -580,23 +940,25 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 2. Train / test split
     # ------------------------------------------------------------------
-    print("\n2. Splitting into train/test sets...")
+    print("\n2. Splitting into train / test sets...")
     rng = np.random.default_rng(args.seed)
-    n = len(X)
-    test_size = int(n * args.test_fraction)
-    all_idx = rng.permutation(n)
-    test_idx  = all_idx[:test_size]
-    train_idx = all_idx[test_size:]
+    n   = len(X)
+    test_size  = int(n * args.test_fraction)
+    all_idx    = rng.permutation(n)
+    test_idx   = all_idx[:test_size]
+    train_idx  = all_idx[test_size:]
 
     X_train = X.iloc[train_idx].reset_index(drop=True)
     X_test  = X.iloc[test_idx].reset_index(drop=True)
     y_train = y.iloc[train_idx].reset_index(drop=True)
     y_test  = y.iloc[test_idx].reset_index(drop=True)
 
-    print(f"  Train: {len(X_train):,} rows   Test: {len(X_test):,} rows")
+    print(f"  Train: {len(X_train):,}   Test: {len(X_test):,}")
+    print(f"  High-identity (≥{HIGH_THRESHOLD}) in test: "
+          f"{(y_test >= HIGH_THRESHOLD).sum():,}")
 
     # ------------------------------------------------------------------
-    # 2b. Feature scaling (fit on training data only, apply to both sets)
+    # 2b. Scale features (fit on train, apply to both)
     # ------------------------------------------------------------------
     print("\n2b. Scaling features (StandardScaler fit on training data only)...")
     feature_scaler = StandardScaler()
@@ -612,38 +974,42 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # 3. Feature selection (Spearman correlation on training set)
+    # 3. Base models
     # ------------------------------------------------------------------
-    print("\n3. Selecting features via combined ranking (Spearman + Pearson + RF importance)...")
-    feature_sets = {}
-    for n_feat in [7, 9, 14, 21, 31]:
-        feature_sets[n_feat] = select_topn_combined(X_train_scaled, y_train, n_feat, seed=args.seed)
-        print(f"  Top {n_feat}: {feature_sets[n_feat]}")
-
-    # ------------------------------------------------------------------
-    # 4. Define base regressors
-    # ------------------------------------------------------------------
-    print("\n4. Defining base regressors...")
+    print("\n3. Defining base regressors...")
     base_models = get_base_regressors(seed=args.seed)
-    print(f"  {len(base_models)} base models defined.")
+    print(f"  {len(base_models)} base models defined: "
+          f"{[n for n, _ in base_models]}")
 
     # ------------------------------------------------------------------
-    # 5. Train and evaluate
+    # 4. Reduced model
     # ------------------------------------------------------------------
-    print("\n5. Evaluating base models and training ensemble...")
-    result = train_and_evaluate_ensemble(
-        X_train_scaled, y_train, X_test_scaled, y_test,
-        feature_sets, base_models,
-        top_k=args.top_k,
+    print("\n4. Training reduced model (GC / Length / Quality features only)...")
+    reduced_result = train_reduced_model(
+        X_train_scaled, y_train,
+        X_test_scaled,  y_test,
+        base_models,
         seed=args.seed,
     )
 
     # ------------------------------------------------------------------
-    # 6. Save models and results
+    # 5. Full model experiments (per kmer config)
+    # ------------------------------------------------------------------
+    print("\n5. Training full models (per kmer configuration)...")
+    full_results = train_full_models(
+        X_train_scaled, y_train,
+        X_test_scaled,  y_test,
+        base_models,
+        seed=args.seed,
+    )
+
+    # ------------------------------------------------------------------
+    # 6. Save artefacts
     # ------------------------------------------------------------------
     print("\n6. Saving models and results...")
-    save_models(args.output_dir, result, feature_scaler=feature_scaler)
-    save_results(args.results, result)
+    save_reduced_model(args.output_dir, reduced_result, feature_scaler=feature_scaler)
+    save_full_models(args.output_dir, full_results, feature_scaler=feature_scaler)
+    save_results_csv(args.results, full_results, reduced_result)
 
     # ------------------------------------------------------------------
     # 7. Summary
@@ -652,22 +1018,45 @@ def main() -> None:
     print("SUMMARY")
     print("=" * 70)
 
-    print("\nPer-model test performance:")
-    print(f"  {'Model':<25}  {'Feats':>5}  {'mean R²':>8}  {'Test R²':>8}  "
-          f"{'MAE':>8}  {'RMSE':>8}")
-    print("  " + "-" * 72)
-    for row in result['test_results_per_model']:
-        print(
-            f"  {row['model_name']:<25}  {row['n_features']:>5}  "
-            f"{row['cv_r2']:>8.4f}  {row['test_r2']:>8.4f}  "
-            f"{row['test_mae']:>8.4f}  {row['test_rmse']:>8.4f}"
-        )
+    # Reduced model classifier table
+    if reduced_result:
+        print(f"\nReduced Model — best: {reduced_result['best_model_name']}")
+        print(f"  Features ({len(reduced_result['features'])}): "
+              f"{reduced_result['features']}")
+        print(f"  Global test  R²={reduced_result['best_stats']['test_r2']:.4f}  "
+              f"MAE={reduced_result['best_stats']['test_mae']:.4f}  "
+              f"RMSE={reduced_result['best_stats']['test_rmse']:.4f}")
+        print()
+        print(f"  {'Threshold':>10}  {'Recall':>8}  {'Precision':>9}  "
+              f"{'F1':>8}  {'TP':>7}  {'FP':>7}  {'TN':>7}  {'FN':>7}")
+        print("  " + "-" * 78)
+        for s in reduced_result['best_stats']['thresh_stats']:
+            print(f"  {s['threshold']:>10.2f}  {s['recall']:>8.4f}  "
+                  f"{s['precision']:>9.4f}  {s['f1']:>8.4f}  "
+                  f"{s['tp']:>7d}  {s['fp']:>7d}  {s['tn']:>7d}  {s['fn']:>7d}")
 
-    em = result['ensemble_metrics']
-    print(f"\nEnsemble (Ridge meta-learner):")
-    print(f"  Test R²   = {em['r2']:.4f}")
-    print(f"  Test MAE  = {em['mae']:.4f}")
-    print(f"  Test RMSE = {em['rmse']:.4f}")
+    # Top-10 full models table
+    valid_full = [
+        r for r in full_results
+        if not np.isnan(r.get('r2_high', float('nan')))
+    ]
+    top10 = sorted(valid_full, key=lambda x: x['r2_high'], reverse=True)[:10]
+
+    if top10:
+        print(f"\nTop 10 full-model candidates  (ranked by R²_high ≥ {HIGH_THRESHOLD}):")
+        hdr = (f"  {'#':>3}  {'Model':<25}  {'KmerConfig':<28}  "
+               f"{'N':>4}  {'Type':<14}  "
+               f"{'R²':>8}  {'R²_high':>8}  {'MAE_high':>9}  {'RMSE_high':>10}")
+        print(hdr)
+        print("  " + "-" * 125)
+        for rank, res in enumerate(top10, 1):
+            ftype = res['feature_set_type'][:14]
+            print(
+                f"  {rank:>3}  {res['model_name']:<25}  {res['kmer_config']:<28}  "
+                f"{res['n_features']:>4}  {ftype:<14}  "
+                f"{res['test_r2']:>8.4f}  {res['r2_high']:>8.4f}  "
+                f"{res['mae_high']:>9.4f}  {res['rmse_high']:>10.4f}"
+            )
 
     print("\n" + "=" * 70)
     print("TRAINING COMPLETE")

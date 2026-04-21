@@ -3,16 +3,22 @@ train_model.py - Train pairwise regression models to predict percent identity
 from sequence metrics.
 
 Pipeline:
-  1. Reduced model (fast screen): GC/Length/Quality features only.
-     - Regressor thresholded as classifier at multiple cutoffs (0.85–0.99).
-     - The fit split is class-balanced (1:1 high/low identity, undersample
-       majority) to improve recall.  Validation and test data are not rebalanced.
-     - Model selection is recall-optimised with a minimum-precision guard:
-         * A validation split (20 % of training data) is used for selection.
-         * Selection score: if precision@85 < PRECISION_MIN → score = -inf
-                            else                            → score = recall@85
-     - Classifier-style metrics are reported on the TEST split only.
-     - Saved as reduced_model.pkl.
+  1. Reduced model (fast binary screen): GC/Length/Quality features only.
+     - Binary target: y_bin = (real_percent_identity >= 85).
+     - True classifiers (LogisticRegression, RidgeClassifier,
+       RandomForestClassifier, GradientBoostingClassifier, MLPClassifier,
+       SGDClassifier) replace the previous regressor+threshold approach.
+     - For each candidate (classifier × feature-set size in {5, 10}):
+         * Continuous scores are obtained via predict_proba (positive class)
+           or decision_function, then a probability/score threshold is tuned
+           on the validation split to maximise recall subject to
+           precision >= PRECISION_MIN.
+         * Selection score = best achievable recall; tie-break by precision.
+     - Dataset is NOT rebalanced; natural class distribution is kept.
+     - On the TEST split, the selected model is evaluated at the chosen
+       threshold and TP/FP/TN/FN, recall, precision, F1 are reported.
+     - Artifacts saved: reduced_model.pkl, reduced_model_features.pkl,
+       reduced_model_metadata.pkl (features, threshold, precision_min).
 
   2. Full model (weighted regression):
      - Sample weights: (y_true / 100)^2  (y_true normalised to [0,1] first).
@@ -25,7 +31,6 @@ Pipeline:
 Data scale note:
   Throughout this script, `y` is in [0, 100] (percent identity).
   The "high identity" threshold is HIGH_THRESHOLD = 85.0 (not 0.85).
-  Classifier thresholds are likewise expressed in [0, 100].
   Sample weights are (y / 100)^2 so that each weight is in [0, 1].
 
 Usage:
@@ -42,8 +47,13 @@ import numpy as np
 import pandas as pd
 from scipy.stats import pearsonr, spearmanr
 from sklearn.base import clone
-from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge, RidgeClassifier, SGDClassifier
+from sklearn.ensemble import (
+    GradientBoostingClassifier,
+    GradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
 from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
@@ -51,7 +61,7 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 from sklearn.preprocessing import StandardScaler
-from sklearn.neural_network import MLPRegressor
+from sklearn.neural_network import MLPClassifier, MLPRegressor
 
 # =========================================================
 # CONSTANTS
@@ -60,13 +70,13 @@ from sklearn.neural_network import MLPRegressor
 # y is in [0, 100].  "High identity" is ≥ 85 %.
 HIGH_THRESHOLD = 85.0
 
-# Thresholds for classifier-style stats on the reduced model (same scale).
-CLASSIFIER_THRESHOLDS = [85.0, 90.0, 95.0, 97.0, 99.0]
-
 # Minimum precision at cutoff 85 required for a reduced-model candidate to be
 # considered during validation-based model selection.  Candidates that fail
 # this floor receive a selection score of -inf and are never chosen as best.
 PRECISION_MIN = 0.10
+
+# Feature set sizes to try for the reduced model.
+REDUCED_FEATURE_SIZES = [5, 10]
 
 # Feature set sizes to test for the full model.
 FULL_MODEL_FEATURE_SIZES = [5, 10, 20]
@@ -373,45 +383,145 @@ def get_base_regressors(seed: int = 23) -> list:
         ]
 
 
-# =========================================================
-# REDUCED MODEL  (GC / Length / Quality only)
-# =========================================================
-
-def compute_classifier_stats(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    threshold: float,
-) -> dict:
+def get_base_classifiers(seed: int = 23) -> list:
     """
-    Treat the regression output as a binary classifier at `threshold`.
+    Return the list of (name, classifier) base classifiers for the reduced model.
 
-    Positive class  = y ≥ threshold  (high-identity pairs).
-    Negative class  = y <  threshold.
-
-    y_true and y_pred are expected in [0, 100] (percent identity scale).
-
-    Returns dict with: threshold, tp, fp, tn, fn, recall, precision, f1.
+    All classifiers target the binary label y_bin = (percent_identity >= 85).
+    Variants of each family are provided to give the threshold-search optimiser
+    a range of precision/recall trade-off surfaces.
     """
-    y_bin_true = (y_true >= threshold).astype(int)
-    y_bin_pred = (y_pred >= threshold).astype(int)
+    return [
+        # Logistic Regression (L2-regularised, varying C = inverse regularisation)
+        ("LogReg_C001",  LogisticRegression(C=0.01,  max_iter=1000, random_state=seed)),
+        ("LogReg_C01",   LogisticRegression(C=0.1,   max_iter=1000, random_state=seed)),
+        ("LogReg_C1",    LogisticRegression(C=1.0,   max_iter=1000, random_state=seed)),
+        ("LogReg_C10",   LogisticRegression(C=10.0,  max_iter=1000, random_state=seed)),
+        ("LogReg_C100",  LogisticRegression(C=100.0, max_iter=1000, random_state=seed)),
 
-    tn, fp, fn, tp = confusion_matrix(y_bin_true, y_bin_pred, labels=[0, 1]).ravel()
+        # Ridge Classifier (uses decision_function, not predict_proba)
+        ("RidgeClf_a001", RidgeClassifier(alpha=0.01)),
+        ("RidgeClf_a01",  RidgeClassifier(alpha=0.1)),
+        ("RidgeClf_a1",   RidgeClassifier(alpha=1.0)),
+        ("RidgeClf_a10",  RidgeClassifier(alpha=10.0)),
+        ("RidgeClf_a100", RidgeClassifier(alpha=100.0)),
 
-    recall    = tp / (tp + fn)           if (tp + fn) > 0           else 0.0
-    precision = tp / (tp + fp)           if (tp + fp) > 0           else 0.0
-    f1        = (2 * precision * recall
-                 / (precision + recall)) if (precision + recall) > 0 else 0.0
+        # Random Forest Classifier
+        ("RFC_md4",  RandomForestClassifier(n_estimators=100, max_depth=4,
+                                            random_state=seed, n_jobs=12)),
+        ("RFC_md6",  RandomForestClassifier(n_estimators=150, max_depth=6,
+                                            random_state=seed, n_jobs=12)),
+        ("RFC_md8",  RandomForestClassifier(n_estimators=200, max_depth=8,
+                                            random_state=seed, n_jobs=12)),
+        ("RFC_md10", RandomForestClassifier(n_estimators=250, max_depth=10,
+                                            random_state=seed, n_jobs=12)),
 
-    return {
-        'threshold': threshold,
-        'tp':        int(tp),
-        'fp':        int(fp),
-        'tn':        int(tn),
-        'fn':        int(fn),
-        'recall':    recall,
-        'precision': precision,
-        'f1':        f1,
-    }
+        # Gradient Boosting Classifier
+        ("GBC_d3_lr01",  GradientBoostingClassifier(n_estimators=200, max_depth=3,
+                                                    learning_rate=0.10, random_state=seed)),
+        ("GBC_d5_lr01",  GradientBoostingClassifier(n_estimators=200, max_depth=5,
+                                                    learning_rate=0.10, random_state=seed)),
+        ("GBC_d3_lr005", GradientBoostingClassifier(n_estimators=300, max_depth=3,
+                                                    learning_rate=0.05, random_state=seed)),
+        ("GBC_d5_lr005", GradientBoostingClassifier(n_estimators=300, max_depth=5,
+                                                    learning_rate=0.05, random_state=seed)),
+
+        # MLP Classifier
+        ("MLPClf_32_16", MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=400,
+                                       random_state=seed)),
+        ("MLPClf_32",    MLPClassifier(hidden_layer_sizes=(32,),    max_iter=400,
+                                       random_state=seed)),
+        ("MLPClf_16_32", MLPClassifier(hidden_layer_sizes=(16, 32), max_iter=400,
+                                       random_state=seed)),
+        ("MLPClf_64",    MLPClassifier(hidden_layer_sizes=(64,),    max_iter=400,
+                                       random_state=seed)),
+
+        # SGD Classifier (log_loss → predict_proba; hinge → decision_function)
+        ("SGDClf_log",  SGDClassifier(loss='log_loss',       max_iter=1000,
+                                      random_state=seed)),
+        ("SGDClf_hub",  SGDClassifier(loss='modified_huber', max_iter=1000,
+                                      random_state=seed)),
+    ]
+
+
+# =========================================================
+# REDUCED MODEL  (GC / Length / Quality only — binary classifier)
+# =========================================================
+
+def _get_classifier_scores(clf, X: pd.DataFrame) -> np.ndarray:
+    """
+    Return continuous scores for the positive class from a fitted classifier.
+
+    Priority:
+      1. predict_proba  → probability of the positive class (:, 1).
+      2. decision_function → raw decision scores (monotone with class boundary).
+      3. Fallback: integer 0/1 predictions cast to float (no threshold search).
+    """
+    if hasattr(clf, 'predict_proba'):
+        return clf.predict_proba(X)[:, 1]
+    if hasattr(clf, 'decision_function'):
+        return clf.decision_function(X)
+    return clf.predict(X).astype(float)
+
+
+def _search_threshold(
+    scores: np.ndarray,
+    y_bin: np.ndarray,
+    precision_min: float,
+) -> tuple:
+    """
+    Find the classification threshold that maximises recall subject to
+    precision >= precision_min.
+
+    Candidate thresholds are the sorted unique score values.  When scores look
+    like probabilities (all in [0, 1]), a uniform grid with step 0.01 is also
+    added to ensure fine-grained coverage.
+
+    Returns:
+        (best_threshold, best_recall, best_precision)
+
+    If no threshold satisfies the precision floor, the fallback is the threshold
+    with the highest recall irrespective of precision (the floor is considered
+    not met for selection purposes — the caller assigns score = -inf).
+    """
+    candidate_thrs = np.unique(scores)
+    if scores.min() >= 0.0 and scores.max() <= 1.0:
+        grid = np.arange(0.01, 1.0, 0.01)
+        candidate_thrs = np.unique(np.concatenate([candidate_thrs, grid]))
+
+    best_rec_floor  = -1.0
+    best_prec_floor = 0.0
+    best_thr_floor  = float(np.median(scores))
+
+    best_rec_any    = -1.0
+    best_prec_any   = 0.0
+    best_thr_any    = float(np.median(scores))
+
+    for thr in candidate_thrs:
+        y_pred_bin = (scores >= thr).astype(int)
+        tp = int(((y_pred_bin == 1) & (y_bin == 1)).sum())
+        fp = int(((y_pred_bin == 1) & (y_bin == 0)).sum())
+        fn = int(((y_pred_bin == 0) & (y_bin == 1)).sum())
+
+        recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+
+        # Track best regardless of floor (fallback)
+        if recall > best_rec_any or (recall == best_rec_any and precision > best_prec_any):
+            best_rec_any  = recall
+            best_prec_any = precision
+            best_thr_any  = float(thr)
+
+        if precision >= precision_min:
+            if recall > best_rec_floor or (
+                    recall == best_rec_floor and precision > best_prec_floor):
+                best_rec_floor  = recall
+                best_prec_floor = precision
+                best_thr_floor  = float(thr)
+
+    if best_rec_floor >= 0.0:
+        return best_thr_floor, best_rec_floor, best_prec_floor
+    return best_thr_any, best_rec_any, best_prec_any
 
 
 def train_reduced_model(
@@ -419,178 +529,189 @@ def train_reduced_model(
     y_train: pd.Series,
     X_test:  pd.DataFrame,
     y_test:  pd.Series,
-    base_models: list,
+    base_classifiers: list,
     seed: int = 23,
     precision_min: float = PRECISION_MIN,
 ) -> dict:
     """
-    Train and evaluate reduced models using only GC / Length / Quality features.
+    Train and select reduced binary classifiers using only GC/Length/Quality
+    features.
 
     Steps:
-      1. Restrict candidate features to gc/length/quality prefixes.
-      2. Select top-10 features via combined ranking (with minimum 1 per group).
-      3. Split the training set into a fit split (80 %) and a validation split
-         (20 %) used exclusively for recall-optimised model selection.
-      4. Balance the fit split to 1:1 high/low identity by undersampling the
-         majority class (y >= 85 vs y < 85).  The validation and test splits
-         are kept at their natural class distribution.
-      5. For each base model:
-         - Train on the balanced fit split (no explicit sample weights).
-         - Compute precision@85 and recall@85 on the validation split.
-         - Selection score:
-             if precision@85 < precision_min  →  score = -inf  (reject)
-             else                             →  score = recall@85
-      6. Pick the best model by validation selection score.
-      7. Report classifier-style stats on the TEST split at thresholds
-         85, 90, 95, 97, 99.  Test data are never rebalanced.
+      1. Split training into fit (80 %) / validation (20 %).
+      2. Binary target: y_bin = (y >= HIGH_THRESHOLD).
+         Dataset is NOT rebalanced; the natural class distribution is kept.
+      3. For each feature-set size N in REDUCED_FEATURE_SIZES ({5, 10}):
+         a. Select top-N GC/Length/Quality features on the fit split using
+            combined ranking (only one transform per base feature; ≥1 per group).
+         b. For each classifier:
+            - Fit on the binary fit split.
+            - Obtain continuous scores on the validation split via
+              predict_proba (positive class) or decision_function.
+            - Search score thresholds (unique values + 0.01-step grid for
+              probabilities) to maximise recall subject to precision >=
+              precision_min.
+            - Candidate score = best achievable recall; tie-break by precision.
+      4. Select the (classifier, N, threshold) triple with the highest
+         validation score.  If no candidate meets the precision floor, fall
+         back to the highest validation recall (with a warning).
+      5. Evaluate the selected model on the TEST split at the chosen threshold:
+         report TP/FP/TN/FN, recall, precision, F1.
 
     Returns:
-        dict with best_model, best_model_name, features, best_stats,
-        all_model_stats.  Empty dict if no suitable features found.
+        dict with best_model, best_model_name, features, threshold,
+        precision_min, best_stats, all_model_stats.
+        Empty dict if no GC/Length/Quality features are found.
     """
-    print("\n--- REDUCED MODEL (GC / Length / Quality only) ---")
+    print("\n--- REDUCED MODEL (GC / Length / Quality — binary classifier) ---")
 
     REDUCED_PREFIXES = [GC_PREFIX, LENGTH_PREFIX, QUALITY_PREFIX]
     REDUCED_QUOTAS   = {GC_PREFIX: 1, LENGTH_PREFIX: 1, QUALITY_PREFIX: 1}
-    N_REDUCED_FEATS  = 10
-
-    print(f"  Selecting top {N_REDUCED_FEATS} GC/Length/Quality features...")
-    reduced_features = select_topn_combined(
-        X_train, y_train, N_REDUCED_FEATS,
-        seed=seed,
-        quotas=REDUCED_QUOTAS,
-        allowed_prefixes=REDUCED_PREFIXES,
-    )
-
-    if not reduced_features:
-        print("  WARNING: No GC/Length/Quality features found. Skipping reduced model.")
-        return {}
-
-    print(f"  Selected features: {reduced_features}")
 
     # ------------------------------------------------------------------
-    # Split training data into fit / validation for model selection.
-    # The test set is reserved exclusively for final metric reporting.
+    # Train / validation split (for model selection only; test is reserved).
     # ------------------------------------------------------------------
-    val_rng   = np.random.default_rng(seed)
-    n_train   = len(X_train)
-    val_size  = max(1, int(n_train * 0.20))
-    perm      = val_rng.permutation(n_train)
-    val_idx   = perm[:val_size]
-    fit_idx   = perm[val_size:]
+    val_rng  = np.random.default_rng(seed)
+    n_train  = len(X_train)
+    val_size = max(1, int(n_train * 0.20))
+    perm     = val_rng.permutation(n_train)
+    val_idx  = perm[:val_size]
+    fit_idx  = perm[val_size:]
 
-    X_val = X_train.iloc[val_idx][reduced_features]
-    y_val = y_train.iloc[val_idx].values
+    y_tr_all    = y_train.values
+    y_te        = y_test.values
+    y_bin_all   = (y_tr_all >= HIGH_THRESHOLD).astype(int)
+    y_bin_test  = (y_te     >= HIGH_THRESHOLD).astype(int)
 
-    X_te_r = X_test[reduced_features]
-    y_te   = y_test.values
+    y_bin_fit = y_bin_all[fit_idx]
+    y_bin_val = y_bin_all[val_idx]
 
-    # ------------------------------------------------------------------
-    # Balance the fit split so that high-identity (y >= 85) and
-    # low-identity samples are equally represented during training.
-    # This counters the recall penalty caused by class imbalance.
-    # The validation and test splits are kept at their natural distribution.
-    # ------------------------------------------------------------------
-    y_fit_all = y_train.iloc[fit_idx].values
-    X_fit_all = X_train.iloc[fit_idx][reduced_features]
-
-    high_mask = y_fit_all >= HIGH_THRESHOLD
-    low_mask  = ~high_mask
-    n_high    = int(high_mask.sum())
-    n_low     = int(low_mask.sum())
-
-    if n_high == 0 or n_low == 0:
-        # Degenerate split — fall back to using the full unbalanced fit set.
-        X_fit = X_fit_all
-        y_fit = y_fit_all
-        print(f"  WARNING: Fit split has no {'high' if n_high == 0 else 'low'}-identity "
-              f"samples (threshold={HIGH_THRESHOLD}); skipping balancing — "
-              f"model will train on imbalanced data, which may reduce recall.")
-    else:
-        # Undersample the majority class to match the minority class size,
-        # keeping each class at exactly min(n_high, n_low) samples.
-        n_bal = min(n_high, n_low)
-        bal_rng = np.random.default_rng(seed + 1)
-        high_idx_local = np.where(high_mask)[0]
-        low_idx_local  = np.where(low_mask)[0]
-        chosen_high = bal_rng.choice(high_idx_local, size=n_bal, replace=False)
-        chosen_low  = bal_rng.choice(low_idx_local,  size=n_bal, replace=False)
-        balanced_idx = np.concatenate([chosen_high, chosen_low])
-        bal_rng.shuffle(balanced_idx)
-        X_fit = X_fit_all.iloc[balanced_idx]
-        y_fit = y_fit_all[balanced_idx]
-        print(f"  Fit split balanced: {n_bal} high + {n_bal} low = {len(y_fit):,} "
-              f"(original {len(y_fit_all):,}: {n_high} high / {n_low} low)")
-
-    print(f"  Val split: {len(X_val):,}   Test split: {len(X_te_r):,}  "
-          f"(precision_min={precision_min})")
+    n_pos_fit = int(y_bin_fit.sum())
+    n_pos_val = int(y_bin_val.sum())
+    n_pos_te  = int(y_bin_test.sum())
+    print(f"  Fit  split: {len(y_bin_fit):,}  ({n_pos_fit:,} positive = "
+          f"{n_pos_fit / max(1, len(y_bin_fit)):.1%})")
+    print(f"  Val  split: {len(y_bin_val):,}  ({n_pos_val:,} positive = "
+          f"{n_pos_val / max(1, len(y_bin_val)):.1%})")
+    print(f"  Test split: {len(y_bin_test):,}  ({n_pos_te:,} positive = "
+          f"{n_pos_te / max(1, len(y_bin_test)):.1%})")
+    print(f"  precision_min = {precision_min}")
 
     model_stats = []
 
-    for name, model in base_models:
-        m = clone(model)
-        m.fit(X_fit, y_fit)
+    for n_feat in REDUCED_FEATURE_SIZES:
+        print(f"\n  -- Feature set size: {n_feat} --")
 
-        # --- Validation-based selection score ---
-        y_val_pred  = m.predict(X_val)
-        val_stats85 = compute_classifier_stats(y_val, y_val_pred, 85.0)
-        val_prec85  = val_stats85['precision']
-        val_rec85   = val_stats85['recall']
-        if val_prec85 < precision_min:
-            sel_score = float('-inf')
-        else:
-            sel_score = val_rec85
+        # Feature selection: use continuous y on the fit split for ranking.
+        reduced_features = select_topn_combined(
+            X_train.iloc[fit_idx], y_train.iloc[fit_idx], n_feat,
+            seed=seed,
+            quotas=REDUCED_QUOTAS,
+            allowed_prefixes=REDUCED_PREFIXES,
+        )
 
-        # --- Test-split metrics (for reporting only) ---
-        y_pred    = m.predict(X_te_r)
-        test_r2   = r2_score(y_te, y_pred)
-        test_mae  = mean_absolute_error(y_te, y_pred)
-        test_rmse = float(np.sqrt(mean_squared_error(y_te, y_pred)))
+        if not reduced_features:
+            print(f"  WARNING: No GC/Length/Quality features found for N={n_feat}. "
+                  "Skipping.")
+            continue
 
-        thresh_stats = [
-            compute_classifier_stats(y_te, y_pred, t)
-            for t in CLASSIFIER_THRESHOLDS
-        ]
-        stats_85 = thresh_stats[0]   # first threshold is 85.0
+        print(f"  Selected features ({n_feat}): {reduced_features}")
 
-        print(f"  [{name}] val_sel={sel_score:.4f} "
-              f"(val_prec@85={val_prec85:.4f}, val_rec@85={val_rec85:.4f}) | "
-              f"test R²={test_r2:.4f}  test_recall@85={stats_85['recall']:.4f}  "
-              f"test_prec@85={stats_85['precision']:.4f}")
+        X_fit  = X_train.iloc[fit_idx][reduced_features]
+        X_val  = X_train.iloc[val_idx][reduced_features]
+        X_te_r = X_test[reduced_features]
 
-        model_stats.append({
-            'model_name':    name,
-            'model':         m,
-            'features':      reduced_features,
-            'sel_score':     sel_score,
-            'val_prec85':    val_prec85,
-            'val_rec85':     val_rec85,
-            'test_r2':       test_r2,
-            'test_mae':      test_mae,
-            'test_rmse':     test_rmse,
-            'thresh_stats':  thresh_stats,
-            'recall_85':     stats_85['recall'],
-            'precision_85':  stats_85['precision'],
-            'f1_85':         stats_85['f1'],
-        })
+        for clf_name, clf in base_classifiers:
+            m = clone(clf)
+            try:
+                m.fit(X_fit, y_bin_fit)
+            except Exception as exc:
+                print(f"  [{clf_name} N={n_feat}] fit failed: {exc!r}")
+                continue
 
-    best = max(model_stats, key=lambda x: x['sel_score'])
-    if best['sel_score'] == float('-inf'):
-        print(f"\n  WARNING: All reduced-model candidates had precision@85 < "
-              f"{precision_min} on the validation split. "
-              f"Returning the candidate with the highest validation recall@85 "
-              f"(precision floor not met).")
-        best = max(model_stats, key=lambda x: x['val_rec85'])
+            # ----------------------------------------------------------
+            # Threshold tuning on validation split.
+            # ----------------------------------------------------------
+            val_scores = _get_classifier_scores(m, X_val)
+            best_thr, val_rec, val_prec = _search_threshold(
+                val_scores, y_bin_val, precision_min
+            )
+            floor_met = val_prec >= precision_min
+            sel_score = val_rec if floor_met else float('-inf')
+
+            # ----------------------------------------------------------
+            # Test evaluation at the chosen threshold (for reporting).
+            # ----------------------------------------------------------
+            test_scores    = _get_classifier_scores(m, X_te_r)
+            y_te_bin_pred  = (test_scores >= best_thr).astype(int)
+
+            tp = int(((y_te_bin_pred == 1) & (y_bin_test == 1)).sum())
+            fp = int(((y_te_bin_pred == 1) & (y_bin_test == 0)).sum())
+            tn = int(((y_te_bin_pred == 0) & (y_bin_test == 0)).sum())
+            fn = int(((y_te_bin_pred == 0) & (y_bin_test == 1)).sum())
+
+            test_recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            test_precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            test_f1        = (
+                2 * test_precision * test_recall
+                / (test_precision + test_recall)
+                if (test_precision + test_recall) > 0 else 0.0
+            )
+
+            print(f"  [{clf_name} N={n_feat}] "
+                  f"val_sel={sel_score:.4f} "
+                  f"(val_rec={val_rec:.4f}, val_prec={val_prec:.4f}, "
+                  f"thr={best_thr:.4f}, floor={'✓' if floor_met else '✗'}) | "
+                  f"test_recall={test_recall:.4f}  test_prec={test_precision:.4f}  "
+                  f"test_f1={test_f1:.4f}")
+
+            model_stats.append({
+                'model_name':      f"{clf_name}_N{n_feat}",
+                'clf_name':        clf_name,
+                'model':           m,
+                'features':        reduced_features,
+                'n_features':      n_feat,
+                'threshold':       best_thr,
+                'sel_score':       sel_score,
+                'val_rec':         val_rec,
+                'val_prec':        val_prec,
+                'floor_met':       floor_met,
+                'test_tp':         tp,
+                'test_fp':         fp,
+                'test_tn':         tn,
+                'test_fn':         fn,
+                'test_recall':     test_recall,
+                'test_precision':  test_precision,
+                'test_f1':         test_f1,
+            })
+
+    if not model_stats:
+        print("  WARNING: No reduced-model candidates found. Returning empty result.")
+        return {}
+
+    # Select best: highest sel_score (recall with precision floor met),
+    # tie-break by val_prec.
+    valid = [s for s in model_stats if s['sel_score'] != float('-inf')]
+    if not valid:
+        print(f"\n  WARNING: All reduced-model candidates had validation "
+              f"precision < {precision_min} (floor not met). "
+              f"Returning the candidate with the highest validation recall.")
+        valid = model_stats
+
+    best = max(valid, key=lambda x: (x['sel_score'], x['val_prec']))
 
     print(f"\n  Best reduced model: {best['model_name']} "
           f"(val_sel={best['sel_score']:.4f}, "
-          f"val_rec@85={best['val_rec85']:.4f}, "
-          f"val_prec@85={best['val_prec85']:.4f})")
+          f"val_rec={best['val_rec']:.4f}, "
+          f"val_prec={best['val_prec']:.4f}, "
+          f"threshold={best['threshold']:.4f})")
 
     return {
         'best_model':      best['model'],
         'best_model_name': best['model_name'],
-        'features':        reduced_features,
+        'features':        best['features'],
+        'threshold':       best['threshold'],
+        'precision_min':   precision_min,
         'best_stats':      best,
         'all_model_stats': model_stats,
     }
@@ -929,7 +1050,7 @@ def save_reduced_model(
     result: dict,
     feature_scaler: StandardScaler = None,
 ) -> None:
-    """Save the best reduced model and its feature list to output_dir."""
+    """Save the best reduced model, its feature list, and metadata to output_dir."""
     os.makedirs(output_dir, exist_ok=True)
 
     if not result:
@@ -938,15 +1059,28 @@ def save_reduced_model(
 
     model_path = os.path.join(output_dir, 'reduced_model.pkl')
     feats_path = os.path.join(output_dir, 'reduced_model_features.pkl')
+    meta_path  = os.path.join(output_dir, 'reduced_model_metadata.pkl')
 
     joblib.dump(result['best_model'], model_path)
     joblib.dump(result['features'],   feats_path)
+    joblib.dump(
+        {
+            'model_name':    result['best_model_name'],
+            'features':      result['features'],
+            'threshold':     result['threshold'],
+            'precision_min': result['precision_min'],
+        },
+        meta_path,
+    )
 
     if feature_scaler is not None:
         joblib.dump(feature_scaler, os.path.join(output_dir, 'feature_scaler.pkl'))
 
-    print(f"  ✓ Reduced model  → {model_path}")
-    print(f"  ✓ Reduced feats  → {feats_path}")
+    print(f"  ✓ Reduced model    → {model_path}")
+    print(f"  ✓ Reduced features → {feats_path}")
+    print(f"  ✓ Reduced metadata → {meta_path}  "
+          f"(threshold={result['threshold']:.4f}, "
+          f"precision_min={result['precision_min']})")
 
 
 def save_full_models(
@@ -1099,19 +1233,22 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 3. Base models
     # ------------------------------------------------------------------
-    print("\n3. Defining base regressors...")
-    base_models = get_base_regressors(seed=args.seed)
-    print(f"  {len(base_models)} base models defined: "
+    print("\n3. Defining base classifiers (reduced model) and regressors (full model)...")
+    base_classifiers = get_base_classifiers(seed=args.seed)
+    base_models      = get_base_regressors(seed=args.seed)
+    print(f"  {len(base_classifiers)} classifiers for reduced model: "
+          f"{[n for n, _ in base_classifiers]}")
+    print(f"  {len(base_models)} regressors for full model: "
           f"{[n for n, _ in base_models]}")
 
     # ------------------------------------------------------------------
     # 4. Reduced model
     # ------------------------------------------------------------------
-    print("\n4. Training reduced model (GC / Length / Quality features only)...")
+    print("\n4. Training reduced model (binary classifier, GC/Length/Quality only)...")
     reduced_result = train_reduced_model(
         X_train_scaled, y_train,
         X_test_scaled,  y_test,
-        base_models,
+        base_classifiers,
         seed=args.seed,
     )
 
@@ -1143,20 +1280,26 @@ def main() -> None:
 
     # Reduced model classifier table
     if reduced_result:
-        print(f"\nReduced Model — best: {reduced_result['best_model_name']}")
+        bs = reduced_result['best_stats']
+        print(f"\nReduced Model (binary classifier) — best: "
+              f"{reduced_result['best_model_name']}")
         print(f"  Features ({len(reduced_result['features'])}): "
               f"{reduced_result['features']}")
-        print(f"  Global test  R²={reduced_result['best_stats']['test_r2']:.4f}  "
-              f"MAE={reduced_result['best_stats']['test_mae']:.4f}  "
-              f"RMSE={reduced_result['best_stats']['test_rmse']:.4f}")
+        print(f"  Chosen threshold : {reduced_result['threshold']:.4f}")
+        print(f"  precision_min    : {reduced_result['precision_min']}")
+        print(f"  Val recall       : {bs['val_rec']:.4f}   "
+              f"Val precision: {bs['val_prec']:.4f}")
         print()
-        print(f"  {'Threshold':>10}  {'Recall':>8}  {'Precision':>9}  "
-              f"{'F1':>8}  {'TP':>7}  {'FP':>7}  {'TN':>7}  {'FN':>7}")
-        print("  " + "-" * 78)
-        for s in reduced_result['best_stats']['thresh_stats']:
-            print(f"  {s['threshold']:>10.2f}  {s['recall']:>8.4f}  "
-                  f"{s['precision']:>9.4f}  {s['f1']:>8.4f}  "
-                  f"{s['tp']:>7d}  {s['fp']:>7d}  {s['tn']:>7d}  {s['fn']:>7d}")
+        print(f"  Test-set results at threshold {reduced_result['threshold']:.4f}:")
+        print(f"  {'Metric':<12}  {'Value':>8}")
+        print("  " + "-" * 22)
+        print(f"  {'Recall':<12}  {bs['test_recall']:>8.4f}")
+        print(f"  {'Precision':<12}  {bs['test_precision']:>8.4f}")
+        print(f"  {'F1':<12}  {bs['test_f1']:>8.4f}")
+        print(f"  {'TP':<12}  {bs['test_tp']:>8d}")
+        print(f"  {'FP':<12}  {bs['test_fp']:>8d}")
+        print(f"  {'TN':<12}  {bs['test_tn']:>8d}")
+        print(f"  {'FN':<12}  {bs['test_fn']:>8d}")
 
     # Top-10 full models table
     valid_full = [

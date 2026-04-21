@@ -44,11 +44,11 @@ def _validate_shard_row_counts(output_csv: str, num_pairs: int, num_shards: int)
         if not os.path.exists(shard_path):
             errors.append(f"  shard {shard_id}: file missing ({shard_path})")
             continue
-        actual = sum(1 for _ in open(shard_path)) - 1  # subtract header line
+        with open(shard_path) as f:
+            actual = sum(1 for _ in f) - 1  # subtract header line
         if actual != expected:
             errors.append(
-                f"  shard {shard_id}: expected {expected} rows, got {actual}"
-                f" ({shard_path})"
+                f"  shard {shard_id}: expected {expected} rows, got {actual} ({shard_path})"
             )
     if errors:
         raise ValueError(
@@ -159,19 +159,26 @@ def main():
             f"(num-pairs={args.num_pairs}) ..."
         )
         procs = []
-        for shard_id in range(args.num_shards):
-            cmd = [sys.executable, sys.argv[0]] + base_argv + [
-                "--shard-id", str(shard_id),
-            ]
-            # Inherit stdout/stderr so output is visible directly.
-            procs.append(subprocess.Popen(cmd))
+        try:
+            for shard_id in range(args.num_shards):
+                cmd = [sys.executable, sys.argv[0]] + base_argv + [
+                    "--shard-id", str(shard_id),
+                ]
+                # Inherit stdout/stderr so output is visible directly.
+                procs.append(subprocess.Popen(cmd))
 
-        # Wait for all children.
-        failed = []
-        for shard_id, proc in enumerate(procs):
-            rc = proc.wait()
-            if rc != 0:
-                failed.append((shard_id, rc))
+            # Wait for all children.
+            failed = []
+            for shard_id, proc in enumerate(procs):
+                rc = proc.wait()
+                if rc != 0:
+                    failed.append((shard_id, rc))
+        except Exception:
+            # Terminate any still-running children before re-raising.
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.terminate()
+            raise
 
         if failed:
             details = ", ".join(f"shard {s} (rc={r})" for s, r in failed)
@@ -191,7 +198,8 @@ def main():
         )
 
         # Final sanity check: merged file should have exactly num_pairs rows.
-        merged_rows = sum(1 for _ in open(args.output)) - 1
+        with open(args.output) as f:
+            merged_rows = sum(1 for _ in f) - 1
         if merged_rows != args.num_pairs:
             raise ValueError(
                 f"Merged CSV has {merged_rows} rows but expected {args.num_pairs}."

@@ -51,7 +51,7 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 from sklearn.preprocessing import StandardScaler
-
+from sklearn.neural_network import MLPRegressor
 
 # =========================================================
 # CONSTANTS
@@ -323,17 +323,30 @@ def get_base_regressors(seed: int = 23) -> list:
     return [
         # Linear models
         ("LinearRegression", LinearRegression()),
-        ("Ridge_a1e-1",      Ridge(alpha=1e-1)),
+        ("Ridge_a001",      Ridge(alpha=0.01)),
+        ("Ridge_a005",        Ridge(alpha=0.05)),
+        ("Ridge_a01",      Ridge(alpha=0.1)),
+        ("Ridge_a05",        Ridge(alpha=0.5)),
         ("Ridge_a1",         Ridge(alpha=1.0)),
+        ("Ridge_a5",        Ridge(alpha=5.0)),
         ("Ridge_a10",        Ridge(alpha=10.0)),
+        ("Ridge_a50",        Ridge(alpha=50.0)),
 
         # Random Forest
         ("RF_md4",  RandomForestRegressor(n_estimators=100, max_depth=4,
-                                          random_state=seed, n_jobs=-1)),
+                                          random_state=seed, n_jobs=12)),
+        ("RF_md6",  RandomForestRegressor(n_estimators=150, max_depth=6,
+                                          random_state=seed, n_jobs=12)),
         ("RF_md8",  RandomForestRegressor(n_estimators=200, max_depth=8,
-                                          random_state=seed, n_jobs=-1)),
+                                          random_state=seed, n_jobs=12)),
+        ("RF_md10", RandomForestRegressor(n_estimators=250, max_depth=10,
+                                           random_state=seed, n_jobs=12)),
         ("RF_md12", RandomForestRegressor(n_estimators=300, max_depth=12,
-                                          random_state=seed, n_jobs=-1)),
+                                          random_state=seed, n_jobs=12)),
+        ("RF_500",  RandomForestRegressor(n_estimators=500, max_depth=6,
+                                          random_state=seed, n_jobs=12)),
+        ("RF_1000", RandomForestRegressor(n_estimators=1000, max_depth=4,
+                                          random_state=seed, n_jobs=12)),
 
         # Gradient Boosting
         ("GBR_d3_lr01",  GradientBoostingRegressor(n_estimators=200, max_depth=3,
@@ -342,7 +355,22 @@ def get_base_regressors(seed: int = 23) -> list:
                                                    learning_rate=0.10, random_state=seed)),
         ("GBR_d3_lr005", GradientBoostingRegressor(n_estimators=300, max_depth=3,
                                                    learning_rate=0.05, random_state=seed)),
-    ]
+        ("GBR_d5_lr005", GradientBoostingRegressor(n_estimators=300, max_depth=5,
+                                                   learning_rate=0.05, random_state=seed)),
+        ("GBR_d3_lr001", GradientBoostingRegressor(n_estimators=200, max_depth=7,
+                                                   learning_rate=0.01, random_state=seed)),
+        ("GBR_d5_lr001", GradientBoostingRegressor(n_estimators=300, max_depth=7,
+                                                   learning_rate=0.01, random_state=seed)),
+    
+        # MLP
+        ('MLP_32_16', MLPRegressor(hidden_layer_sizes=(32, 16), max_iter=400)),
+        ('MLP_32_', MLPRegressor(hidden_layer_sizes=(32,), max_iter=400)),
+        ('MLP_16_32', MLPRegressor(hidden_layer_sizes=(16, 32), max_iter=400)),
+        ('MLP_16', MLPRegressor(hidden_layer_sizes=(16,), max_iter=400)),
+        ('MLP_32_32', MLPRegressor(hidden_layer_sizes=(32, 32), max_iter=400)),
+        ('MLP_64', MLPRegressor(hidden_layer_sizes=(64,), max_iter=400)),
+
+        ]
 
 
 # =========================================================

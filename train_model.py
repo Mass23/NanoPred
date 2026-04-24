@@ -10,15 +10,19 @@ Pipeline:
        SGDClassifier) replace the previous regressor+threshold approach.
      - For each candidate (classifier × feature-set size in {5, 10}):
          * Continuous scores are obtained via predict_proba (positive class)
-           or decision_function, then a probability/score threshold is tuned
-           on the validation split to maximise recall subject to
-           precision >= PRECISION_MIN.
-         * Selection score = best achievable recall; tie-break by precision.
+           or decision_function, then a threshold is chosen on the validation
+           split that achieves recall >= TARGET_RECALL (0.99) with maximum
+           precision.  Candidates that cannot reach TARGET_RECALL at any
+           threshold are treated as invalid for selection.
+         * Selection: best validation precision among recall-met candidates;
+           tie-break by higher recall, then fewer predicted positives, then
+           model name.
      - Dataset is NOT rebalanced; natural class distribution is kept.
      - On the TEST split, the selected model is evaluated at the chosen
-       threshold and TP/FP/TN/FN, recall, precision, F1 are reported.
+       threshold and TP/FP/TN/FN, recall, precision, FP proportion, F1 are
+       reported.
      - Artifacts saved: reduced_model.pkl, reduced_model_features.pkl,
-       reduced_model_metadata.pkl (features, threshold, precision_min).
+       reduced_model_metadata.pkl (features, threshold, target_recall).
 
   2. Full model (weighted regression):
      - Sample weights: (y_true / 100)^2  (y_true normalised to [0,1] first).
@@ -74,6 +78,11 @@ HIGH_THRESHOLD = 85.0
 # considered during validation-based model selection.  Candidates that fail
 # this floor receive a selection score of -inf and are never chosen as best.
 PRECISION_MIN = 0.10
+
+# Target recall that each reduced-model candidate must achieve on the
+# validation split.  Candidates that cannot reach this recall at any threshold
+# are treated as invalid for selection.
+TARGET_RECALL = 0.99
 
 # Feature set sizes to try for the reduced model.
 REDUCED_FEATURE_SIZES = [5, 10]
@@ -464,38 +473,38 @@ def _get_classifier_scores(clf, X: pd.DataFrame) -> np.ndarray:
     return clf.predict(X).astype(float)
 
 
-def _search_threshold(
+def _search_threshold_for_target_recall(
     scores: np.ndarray,
     y_bin: np.ndarray,
-    precision_min: float,
+    target_recall: float = TARGET_RECALL,
 ) -> tuple:
     """
-    Find the classification threshold that maximises recall subject to
-    precision >= precision_min.
+    Find the classification threshold that achieves recall >= target_recall
+    with the highest possible precision.
 
     Candidate thresholds are the sorted unique score values.  When scores look
     like probabilities (all in [0, 1]), a uniform grid with step 0.01 is also
     added to ensure fine-grained coverage.
 
     Returns:
-        (best_threshold, best_recall, best_precision)
+        (best_threshold, best_recall, best_precision, target_met)
 
-    If no threshold satisfies the precision floor, the fallback is the threshold
-    with the highest recall irrespective of precision (the floor is considered
-    not met for selection purposes — the caller assigns score = -inf).
+    target_met is True when at least one threshold achieves recall >= target_recall.
+    If no threshold meets the recall target, returns the threshold with the
+    highest recall and target_met=False.
     """
     candidate_thrs = np.unique(scores)
     if scores.min() >= 0.0 and scores.max() <= 1.0:
         grid = np.arange(0.01, 1.0, 0.01)
         candidate_thrs = np.unique(np.concatenate([candidate_thrs, grid]))
 
-    best_rec_floor  = -1.0
-    best_prec_floor = 0.0
-    best_thr_floor  = float(np.median(scores))
+    best_rec_target  = -1.0
+    best_prec_target = 0.0
+    best_thr_target  = float(np.median(scores))
 
-    best_rec_any    = -1.0
-    best_prec_any   = 0.0
-    best_thr_any    = float(np.median(scores))
+    best_rec_any     = -1.0
+    best_prec_any    = 0.0
+    best_thr_any     = float(np.median(scores))
 
     for thr in candidate_thrs:
         y_pred_bin = (scores >= thr).astype(int)
@@ -506,22 +515,26 @@ def _search_threshold(
         recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
 
-        # Track best regardless of floor (fallback)
+        # Track overall best (fallback when target cannot be met)
         if recall > best_rec_any or (recall == best_rec_any and precision > best_prec_any):
             best_rec_any  = recall
             best_prec_any = precision
             best_thr_any  = float(thr)
 
-        if precision >= precision_min:
-            if recall > best_rec_floor or (
-                    recall == best_rec_floor and precision > best_prec_floor):
-                best_rec_floor  = recall
-                best_prec_floor = precision
-                best_thr_floor  = float(thr)
+        # Track best among thresholds that meet the recall target:
+        # maximise precision, then recall, then threshold (to minimise FPs).
+        if recall >= target_recall:
+            if (precision > best_prec_target
+                    or (precision == best_prec_target and recall > best_rec_target)
+                    or (precision == best_prec_target and recall == best_rec_target
+                        and float(thr) > best_thr_target)):
+                best_rec_target  = recall
+                best_prec_target = precision
+                best_thr_target  = float(thr)
 
-    if best_rec_floor >= 0.0:
-        return best_thr_floor, best_rec_floor, best_prec_floor
-    return best_thr_any, best_rec_any, best_prec_any
+    if best_rec_target >= 0.0:
+        return best_thr_target, best_rec_target, best_prec_target, True
+    return best_thr_any, best_rec_any, best_prec_any, False
 
 
 def train_reduced_model(
@@ -531,7 +544,6 @@ def train_reduced_model(
     y_test:  pd.Series,
     base_classifiers: list,
     seed: int = 23,
-    precision_min: float = PRECISION_MIN,
 ) -> dict:
     """
     Train and select reduced binary classifiers using only GC/Length/Quality
@@ -548,19 +560,19 @@ def train_reduced_model(
             - Fit on the binary fit split.
             - Obtain continuous scores on the validation split via
               predict_proba (positive class) or decision_function.
-            - Search score thresholds (unique values + 0.01-step grid for
-              probabilities) to maximise recall subject to precision >=
-              precision_min.
-            - Candidate score = best achievable recall; tie-break by precision.
+            - Choose a threshold achieving recall >= TARGET_RECALL with
+              maximum precision (tie-break: higher threshold to reduce FPs).
+            - Candidates that cannot reach TARGET_RECALL are marked invalid.
       4. Select the (classifier, N, threshold) triple with the highest
-         validation score.  If no candidate meets the precision floor, fall
-         back to the highest validation recall (with a warning).
+         validation precision among candidates that met TARGET_RECALL.
+         Tie-breaks: higher recall, then fewer predicted positives, then name.
+         If no candidate meets TARGET_RECALL, emit a warning and return {}.
       5. Evaluate the selected model on the TEST split at the chosen threshold:
-         report TP/FP/TN/FN, recall, precision, F1.
+         report TP/FP/TN/FN, recall, precision, FP proportion, F1.
 
     Returns:
         dict with best_model, best_model_name, features, threshold,
-        precision_min, best_stats, all_model_stats.
+        target_recall, best_stats, all_model_stats.
         Empty dict if no GC/Length/Quality features are found.
     """
     print("\n--- REDUCED MODEL (GC / Length / Quality — binary classifier) ---")
@@ -595,7 +607,7 @@ def train_reduced_model(
           f"{n_pos_val / max(1, len(y_bin_val)):.1%})")
     print(f"  Test split: {len(y_bin_test):,}  ({n_pos_te:,} positive = "
           f"{n_pos_te / max(1, len(y_bin_test)):.1%})")
-    print(f"  precision_min = {precision_min}")
+    print(f"  target_recall = {TARGET_RECALL}")
 
     model_stats = []
 
@@ -633,11 +645,8 @@ def train_reduced_model(
             # Threshold tuning on validation split.
             # ----------------------------------------------------------
             val_scores = _get_classifier_scores(m, X_val)
-            best_thr, val_rec, val_prec = _search_threshold(
-                val_scores, y_bin_val, precision_min
-            )
-            floor_met = val_prec >= precision_min
-            sel_score = val_rec if floor_met else float('-inf')
+            best_thr, val_rec, val_prec, target_met = \
+                _search_threshold_for_target_recall(val_scores, y_bin_val)
 
             # ----------------------------------------------------------
             # Test evaluation at the chosen threshold (for reporting).
@@ -652,18 +661,21 @@ def train_reduced_model(
 
             test_recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
             test_precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            test_fp_prop   = fp / (tp + fp) if (tp + fp) > 0 else 0.0
             test_f1        = (
                 2 * test_precision * test_recall
                 / (test_precision + test_recall)
                 if (test_precision + test_recall) > 0 else 0.0
             )
 
+            val_fp_prop = 1.0 - val_prec if val_prec >= 0.0 else 0.0
             print(f"  [{clf_name} N={n_feat}] "
-                  f"val_sel={sel_score:.4f} "
-                  f"(val_rec={val_rec:.4f}, val_prec={val_prec:.4f}, "
-                  f"thr={best_thr:.4f}, floor={'✓' if floor_met else '✗'}) | "
+                  f"val_rec={val_rec:.4f}  val_prec={val_prec:.4f}  "
+                  f"val_fp_prop={val_fp_prop:.4f}  "
+                  f"thr={best_thr:.4f}  "
+                  f"target_met={'✓' if target_met else '✗'} | "
                   f"test_recall={test_recall:.4f}  test_prec={test_precision:.4f}  "
-                  f"test_f1={test_f1:.4f}")
+                  f"test_fp_prop={test_fp_prop:.4f}  test_f1={test_f1:.4f}")
 
             model_stats.append({
                 'model_name':      f"{clf_name}_N{n_feat}",
@@ -672,16 +684,18 @@ def train_reduced_model(
                 'features':        reduced_features,
                 'n_features':      n_feat,
                 'threshold':       best_thr,
-                'sel_score':       sel_score,
+                'target_met':      target_met,
                 'val_rec':         val_rec,
                 'val_prec':        val_prec,
-                'floor_met':       floor_met,
+                'val_fp_prop':     val_fp_prop,
+                'val_n_pred_pos':  int((val_scores >= best_thr).sum()),
                 'test_tp':         tp,
                 'test_fp':         fp,
                 'test_tn':         tn,
                 'test_fn':         fn,
                 'test_recall':     test_recall,
                 'test_precision':  test_precision,
+                'test_fp_prop':    test_fp_prop,
                 'test_f1':         test_f1,
             })
 
@@ -689,29 +703,39 @@ def train_reduced_model(
         print("  WARNING: No reduced-model candidates found. Returning empty result.")
         return {}
 
-    # Select best: highest sel_score (recall with precision floor met),
-    # tie-break by val_prec.
-    valid = [s for s in model_stats if s['sel_score'] != float('-inf')]
+    # Select best: among candidates that met TARGET_RECALL, choose the one
+    # with highest validation precision; tie-break by higher recall, then
+    # fewer predicted positives, then model name (alphabetical).
+    valid = [s for s in model_stats if s['target_met']]
     if not valid:
-        print(f"\n  WARNING: All reduced-model candidates had validation "
-              f"precision < {precision_min} (floor not met). "
-              f"Returning the candidate with the highest validation recall.")
-        valid = model_stats
+        print(f"\n  WARNING: No reduced-model candidate achieved validation "
+              f"recall >= {TARGET_RECALL}. "
+              f"Returning empty result.")
+        return {}
 
-    best = max(valid, key=lambda x: (x['sel_score'], x['val_prec']))
+    best = max(
+        valid,
+        key=lambda x: (
+            x['val_prec'],
+            x['val_rec'],
+            -x['val_n_pred_pos'],
+            x['model_name'],
+        ),
+    )
 
     print(f"\n  Best reduced model: {best['model_name']} "
-          f"(val_sel={best['sel_score']:.4f}, "
-          f"val_rec={best['val_rec']:.4f}, "
+          f"(val_rec={best['val_rec']:.4f}, "
           f"val_prec={best['val_prec']:.4f}, "
-          f"threshold={best['threshold']:.4f})")
+          f"val_fp_prop={best['val_fp_prop']:.4f}, "
+          f"threshold={best['threshold']:.4f}, "
+          f"target_met={best['target_met']})")
 
     return {
         'best_model':      best['model'],
         'best_model_name': best['model_name'],
         'features':        best['features'],
         'threshold':       best['threshold'],
-        'precision_min':   precision_min,
+        'target_recall':   TARGET_RECALL,
         'best_stats':      best,
         'all_model_stats': model_stats,
     }
@@ -1068,7 +1092,7 @@ def save_reduced_model(
             'model_name':    result['best_model_name'],
             'features':      result['features'],
             'threshold':     result['threshold'],
-            'precision_min': result['precision_min'],
+            'target_recall': result['target_recall'],
         },
         meta_path,
     )
@@ -1080,7 +1104,7 @@ def save_reduced_model(
     print(f"  ✓ Reduced features → {feats_path}")
     print(f"  ✓ Reduced metadata → {meta_path}  "
           f"(threshold={result['threshold']:.4f}, "
-          f"precision_min={result['precision_min']})")
+          f"target_recall={result['target_recall']})")
 
 
 def save_full_models(
@@ -1286,20 +1310,22 @@ def main() -> None:
         print(f"  Features ({len(reduced_result['features'])}): "
               f"{reduced_result['features']}")
         print(f"  Chosen threshold : {reduced_result['threshold']:.4f}")
-        print(f"  precision_min    : {reduced_result['precision_min']}")
+        print(f"  target_recall    : {reduced_result['target_recall']}")
         print(f"  Val recall       : {bs['val_rec']:.4f}   "
-              f"Val precision: {bs['val_prec']:.4f}")
+              f"Val precision: {bs['val_prec']:.4f}   "
+              f"Val FP proportion: {bs['val_fp_prop']:.4f}")
         print()
         print(f"  Test-set results at threshold {reduced_result['threshold']:.4f}:")
-        print(f"  {'Metric':<12}  {'Value':>8}")
-        print("  " + "-" * 22)
-        print(f"  {'Recall':<12}  {bs['test_recall']:>8.4f}")
-        print(f"  {'Precision':<12}  {bs['test_precision']:>8.4f}")
-        print(f"  {'F1':<12}  {bs['test_f1']:>8.4f}")
-        print(f"  {'TP':<12}  {bs['test_tp']:>8d}")
-        print(f"  {'FP':<12}  {bs['test_fp']:>8d}")
-        print(f"  {'TN':<12}  {bs['test_tn']:>8d}")
-        print(f"  {'FN':<12}  {bs['test_fn']:>8d}")
+        print(f"  {'Metric':<16}  {'Value':>8}")
+        print("  " + "-" * 26)
+        print(f"  {'Recall':<16}  {bs['test_recall']:>8.4f}")
+        print(f"  {'Precision':<16}  {bs['test_precision']:>8.4f}")
+        print(f"  {'FP proportion':<16}  {bs['test_fp_prop']:>8.4f}")
+        print(f"  {'F1':<16}  {bs['test_f1']:>8.4f}")
+        print(f"  {'TP':<16}  {bs['test_tp']:>8d}")
+        print(f"  {'FP':<16}  {bs['test_fp']:>8d}")
+        print(f"  {'TN':<16}  {bs['test_tn']:>8d}")
+        print(f"  {'FN':<16}  {bs['test_fn']:>8d}")
 
     # Top-10 full models table
     valid_full = [

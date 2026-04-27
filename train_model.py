@@ -3,34 +3,40 @@ train_model.py - Train pairwise regression models to predict percent identity
 from sequence metrics.
 
 Pipeline:
-  1. Reduced model (fast binary screen): GC/Length/Quality features only.
-     - Binary target: y_bin = (real_percent_identity >= 85).
-     - True classifiers (LogisticRegression, RidgeClassifier,
-       RandomForestClassifier, GradientBoostingClassifier, MLPClassifier,
-       SGDClassifier) replace the previous regressor+threshold approach.
-     - For each candidate (classifier × feature-set size in {5, 10}):
-         * Continuous scores are obtained via predict_proba (positive class)
-           or decision_function, then a threshold is chosen on the validation
-           split that achieves recall >= TARGET_RECALL (0.99) with maximum
-           precision.  Candidates that cannot reach TARGET_RECALL at any
-           threshold are treated as invalid for selection.
-         * Selection: best validation precision among recall-met candidates;
-           tie-break by higher recall, then fewer predicted positives, then
-           model name.
-     - Dataset is NOT rebalanced; natural class distribution is kept.
-     - On the TEST split, the selected model is evaluated at the chosen
-       threshold and TP/FP/TN/FN, recall, precision, FP proportion, F1 are
-       reported.
-     - Artifacts saved: reduced_model.pkl, reduced_model_features.pkl,
-       reduced_model_metadata.pkl (features, threshold, target_recall).
+  Phase A — Fast model comparison on a 100 k subsample:
+    1. A stratified (or oversampled) subsample of 100 k rows is drawn from the
+       filtered dataset, with at least 10 % positives (y_bin == 1).
+    2. The subsample is split 50 % / 25 % / 25 % (fit / val / test).
+    3. Reduced-model candidates are trained and ranked on this subsample;
+       the winning (classifier family × feature-set size) configuration is
+       identified.
+    4. Full-model experiments are also run on the subsample for reference.
 
-  2. Full model (weighted regression):
-     - Sample weights: (y_true / 100)^2  (y_true normalised to [0,1] first).
-     - Separate model suites for each k-mer/hash configuration.
-     - Feature sets of size 5, 10, 20.
-     - Also 50 random feature sets per size.
-     - Reports R², MAE, RMSE globally and on the high-identity subset
-       (y_true ≥ 85.0, i.e. 85 % in [0–100] scale).
+  Phase B — Retrain final models on the full dataset:
+    5. Reduced model: the Phase-A winning configuration is retrained on the
+       full dataset (80 % fit / 20 % val for threshold tuning; test on the
+       held-out test fraction).  Threshold is re-tuned to meet recall ≥ 0.99.
+    6. Full models: all kmer-configuration experiments are repeated on the
+       full dataset split.
+    7. Final artefacts are saved: reduced_model.pkl, reduced_model_features.pkl,
+       reduced_model_metadata.pkl, feature_scaler.pkl, and top-10 full models.
+
+  Reduced model (fast binary screen):
+    - Binary target: y_bin = (real_percent_identity >= 85).
+    - True classifiers (LogisticRegression, RidgeClassifier,
+      RandomForestClassifier, GradientBoostingClassifier, MLPClassifier,
+      SGDClassifier).
+    - Threshold selection: maximise precision subject to recall >= TARGET_RECALL
+      (0.99).  If no candidate achieves the target recall, the candidate with
+      the highest achievable recall is used with a loud warning.
+
+  Full model (weighted regression):
+    - Sample weights: (y_true / 100)^2  (y_true normalised to [0,1] first).
+    - Separate model suites for each k-mer/hash configuration.
+    - Feature sets of size 5, 10, 20.
+    - Also 50 random feature sets per size.
+    - Reports R², MAE, RMSE globally and on the high-identity subset
+      (y_true ≥ 85.0, i.e. 85 % in [0–100] scale).
 
 Data scale note:
   Throughout this script, `y` is in [0, 100] (percent identity).
@@ -39,7 +45,8 @@ Data scale note:
 
 Usage:
     python train_model.py --input all_pairs_data.csv --output-dir models/ \\
-        [--results results.csv] [--seed 23]
+        [--results results.csv] [--seed 23] \\
+        [--subsample-size 100000] [--min-positive-frac 0.10] [--no-retrain]
 """
 
 import argparse
@@ -99,6 +106,15 @@ LENGTH_PREFIX  = "length"
 QUALITY_PREFIX = "quality"
 KMER_PREFIX    = "kmer"
 
+# Default subsample size and minimum positive fraction for Phase A comparison.
+SUBSAMPLE_SIZE    = 100_000
+MIN_POSITIVE_FRAC = 0.10
+
+# val_fraction used when calling train_reduced_model on the 75 % train+val
+# portion of the 100 k subsample so that the overall split is 50/25/25.
+# 25 k val / 75 k train+val = 1/3.
+SUBSAMPLE_VAL_FRACTION = 1 / 3
+
 
 # =========================================================
 # DATA LOADING AND PREPARATION
@@ -144,6 +160,77 @@ def load_and_prepare_data(csv_path: str) -> tuple:
     print(f"  Features: {len(feature_cols)}, Target: '{target}'")
     print(f"  Target range: [{y.min():.2f}, {y.max():.2f}]  mean={y.mean():.2f}")
     return X, y
+
+
+def draw_subsample(
+    X: pd.DataFrame,
+    y: pd.Series,
+    subsample_size: int = SUBSAMPLE_SIZE,
+    min_pos_frac: float = MIN_POSITIVE_FRAC,
+    seed: int = 23,
+) -> tuple:
+    """
+    Draw a subsample of ``subsample_size`` rows from (X, y) with at least
+    ``min_pos_frac`` fraction of positives (y >= HIGH_THRESHOLD).
+
+    Sampling strategy:
+    - If the natural positive fraction >= min_pos_frac: stratified sampling
+      that preserves the natural class ratio (without replacement).
+    - If the natural positive fraction < min_pos_frac: oversample positives
+      (without replacement if enough samples are available; with replacement
+      only if necessary) and fill the remainder with negatives.
+    - If total rows < subsample_size the full dataset is returned unchanged.
+
+    The sampling is fully deterministic via ``seed``.
+
+    Returns:
+        (X_sub, y_sub) as (DataFrame, Series) with reset index.
+    """
+    rng = np.random.default_rng(seed)
+    n_total = len(X)
+
+    y_bin = (y.values >= HIGH_THRESHOLD).astype(int)
+    pos_idx = np.where(y_bin == 1)[0]
+    neg_idx = np.where(y_bin == 0)[0]
+    n_pos_natural = len(pos_idx)
+    n_neg_natural = len(neg_idx)
+    natural_pos_frac = n_pos_natural / max(1, n_total)
+
+    n_sub = min(subsample_size, n_total)
+    n_pos_min = int(np.ceil(n_sub * min_pos_frac))
+
+    if natural_pos_frac >= min_pos_frac:
+        # Stratified: preserve natural ratio but do not exceed available counts.
+        n_pos_target = min(
+            n_pos_natural,
+            max(n_pos_min, round(n_sub * natural_pos_frac)),
+        )
+        n_neg_target = min(n_neg_natural, n_sub - n_pos_target)
+        # Re-adjust positives if negatives were capped.
+        n_pos_target = n_sub - n_neg_target
+        sampled_pos = rng.choice(pos_idx, size=n_pos_target, replace=False)
+        sampled_neg = rng.choice(neg_idx, size=n_neg_target, replace=False)
+    else:
+        # Not enough positives naturally; oversample to reach min_pos_frac.
+        n_pos_target = n_pos_min
+        n_neg_target = n_sub - n_pos_target
+        replace_with_replacement_pos = n_pos_target > n_pos_natural
+        if replace_with_replacement_pos:
+            print(f"  NOTE: Oversampling positives with replacement "
+                  f"({n_pos_natural:,} available, {n_pos_target:,} needed).")
+        sampled_pos = rng.choice(pos_idx, size=n_pos_target, replace=replace_with_replacement_pos)
+        replace_with_replacement_neg = n_neg_target > n_neg_natural
+        if replace_with_replacement_neg:
+            print(f"  NOTE: Oversampling negatives with replacement "
+                  f"({n_neg_natural:,} available, {n_neg_target:,} needed).")
+        sampled_neg = rng.choice(neg_idx, size=n_neg_target, replace=replace_with_replacement_neg)
+
+    chosen_idx = np.concatenate([sampled_pos, sampled_neg])
+    rng.shuffle(chosen_idx)
+
+    X_sub = X.iloc[chosen_idx].reset_index(drop=True)
+    y_sub = y.iloc[chosen_idx].reset_index(drop=True)
+    return X_sub, y_sub
 
 
 # =========================================================
@@ -544,19 +631,23 @@ def train_reduced_model(
     y_test:  pd.Series,
     base_classifiers: list,
     seed: int = 23,
+    val_fraction: float = 0.20,
+    clf_filter: str = None,
+    n_feat_filter: int = None,
 ) -> dict:
     """
     Train and select reduced binary classifiers using only GC/Length/Quality
     features.
 
     Steps:
-      1. Split training into fit (80 %) / validation (20 %).
+      1. Split training into fit / validation using ``val_fraction`` (default 20 %).
       2. Binary target: y_bin = (y >= HIGH_THRESHOLD).
          Dataset is NOT rebalanced; the natural class distribution is kept.
-      3. For each feature-set size N in REDUCED_FEATURE_SIZES ({5, 10}):
+      3. For each feature-set size N in REDUCED_FEATURE_SIZES ({5, 10})
+         (or only ``n_feat_filter`` if provided):
          a. Select top-N GC/Length/Quality features on the fit split using
             combined ranking (only one transform per base feature; ≥1 per group).
-         b. For each classifier:
+         b. For each classifier (or only ``clf_filter`` if provided):
             - Fit on the binary fit split.
             - Obtain continuous scores on the validation split via
               predict_proba (positive class) or decision_function.
@@ -566,9 +657,19 @@ def train_reduced_model(
       4. Select the (classifier, N, threshold) triple with the highest
          validation precision among candidates that met TARGET_RECALL.
          Tie-breaks: higher recall, then fewer predicted positives, then name.
-         If no candidate meets TARGET_RECALL, emit a warning and return {}.
+         If no candidate meets TARGET_RECALL, emit a loud warning and fall back
+         to the candidate with the highest achievable recall.
       5. Evaluate the selected model on the TEST split at the chosen threshold:
          report TP/FP/TN/FN, recall, precision, FP proportion, F1.
+
+    Args:
+        val_fraction:  Fraction of X_train used for validation (default 0.20).
+                       Set to ~1/3 when X_train is 75 % of a subsample so that
+                       the overall split is 50/25/25.
+        clf_filter:    When not None, only train classifiers whose name equals
+                       this string (used in Phase B to retrain the Phase-A winner).
+        n_feat_filter: When not None, only try this specific feature-set size
+                       (used in Phase B to retrain the Phase-A winner).
 
     Returns:
         dict with best_model, best_model_name, features, threshold,
@@ -585,7 +686,7 @@ def train_reduced_model(
     # ------------------------------------------------------------------
     val_rng  = np.random.default_rng(seed)
     n_train  = len(X_train)
-    val_size = max(1, int(n_train * 0.20))
+    val_size = max(1, int(n_train * val_fraction))
     perm     = val_rng.permutation(n_train)
     val_idx  = perm[:val_size]
     fit_idx  = perm[val_size:]
@@ -609,9 +710,25 @@ def train_reduced_model(
           f"{n_pos_te / max(1, len(y_bin_test)):.1%})")
     print(f"  target_recall = {TARGET_RECALL}")
 
+    # Apply optional filters (used in Phase B to retrain only the Phase-A winner).
+    classifiers_to_run = (
+        [(n, c) for n, c in base_classifiers if n == clf_filter]
+        if clf_filter is not None
+        else base_classifiers
+    )
+    feature_sizes_to_run = (
+        [n_feat_filter]
+        if n_feat_filter is not None
+        else REDUCED_FEATURE_SIZES
+    )
+    if clf_filter is not None:
+        print(f"  Classifier filter: {clf_filter!r}")
+    if n_feat_filter is not None:
+        print(f"  Feature-size filter: {n_feat_filter}")
+
     model_stats = []
 
-    for n_feat in REDUCED_FEATURE_SIZES:
+    for n_feat in feature_sizes_to_run:
         print(f"\n  -- Feature set size: {n_feat} --")
 
         # Feature selection: use continuous y on the fit split for ranking.
@@ -633,7 +750,7 @@ def train_reduced_model(
         X_val  = X_train.iloc[val_idx][reduced_features]
         X_te_r = X_test[reduced_features]
 
-        for clf_name, clf in base_classifiers:
+        for clf_name, clf in classifiers_to_run:
             m = clone(clf)
             try:
                 m.fit(X_fit, y_bin_fit)
@@ -708,36 +825,57 @@ def train_reduced_model(
     # fewer predicted positives, then model name (alphabetical).
     valid = [s for s in model_stats if s['target_met']]
     if not valid:
-        print(f"\n  WARNING: No reduced-model candidate achieved validation "
-              f"recall >= {TARGET_RECALL}. "
-              f"Returning empty result.")
-        return {}
+        print(f"\n  {'!' * 62}")
+        print(f"  WARNING: No reduced-model candidate achieved validation")
+        print(f"           recall >= {TARGET_RECALL}!")
+        print(f"           Falling back to the candidate with the highest")
+        print(f"           achievable recall.  Check your data and features.")
+        print(f"  {'!' * 62}")
+        best = max(
+            model_stats,
+            key=lambda x: (
+                x['val_rec'],
+                x['val_prec'],
+                -x['val_n_pred_pos'],
+                x['model_name'],
+            ),
+        )
+    else:
+        best = max(
+            valid,
+            key=lambda x: (
+                x['val_prec'],
+                x['val_rec'],
+                -x['val_n_pred_pos'],
+                x['model_name'],
+            ),
+        )
 
-    best = max(
-        valid,
-        key=lambda x: (
-            x['val_prec'],
-            x['val_rec'],
-            -x['val_n_pred_pos'],
-            x['model_name'],
-        ),
-    )
-
-    print(f"\n  Best reduced model: {best['model_name']} "
-          f"(val_rec={best['val_rec']:.4f}, "
-          f"val_prec={best['val_prec']:.4f}, "
-          f"val_fp_prop={best['val_fp_prop']:.4f}, "
-          f"threshold={best['threshold']:.4f}, "
-          f"target_met={best['target_met']})")
+    target_recall_met = bool(valid)
+    if not target_recall_met:
+        print(f"\n  Best reduced model (fallback — target recall NOT met): "
+              f"{best['model_name']} "
+              f"(val_rec={best['val_rec']:.4f}, "
+              f"val_prec={best['val_prec']:.4f}, "
+              f"val_fp_prop={best['val_fp_prop']:.4f}, "
+              f"threshold={best['threshold']:.4f})")
+    else:
+        print(f"\n  Best reduced model: {best['model_name']} "
+              f"(val_rec={best['val_rec']:.4f}, "
+              f"val_prec={best['val_prec']:.4f}, "
+              f"val_fp_prop={best['val_fp_prop']:.4f}, "
+              f"threshold={best['threshold']:.4f}, "
+              f"target_met={best['target_met']})")
 
     return {
-        'best_model':      best['model'],
-        'best_model_name': best['model_name'],
-        'features':        best['features'],
-        'threshold':       best['threshold'],
-        'target_recall':   TARGET_RECALL,
-        'best_stats':      best,
-        'all_model_stats': model_stats,
+        'best_model':         best['model'],
+        'best_model_name':    best['model_name'],
+        'features':           best['features'],
+        'threshold':          best['threshold'],
+        'target_recall':      TARGET_RECALL,
+        'target_recall_met':  target_recall_met,
+        'best_stats':         best,
+        'all_model_stats':    model_stats,
     }
 
 
@@ -1168,6 +1306,65 @@ def save_results_csv(
 # MAIN
 # =========================================================
 
+def _print_reduced_summary(reduced_result: dict, header: str) -> None:
+    """Print a summary table for a reduced model result dict."""
+    if not reduced_result:
+        print(f"  {header}: no result available.")
+        return
+    bs = reduced_result['best_stats']
+    target_met = reduced_result.get('target_recall_met', bs.get('target_met', False))
+    recall_tag = "✓ target recall met" if target_met else "✗ TARGET RECALL NOT MET"
+    print(f"\n{header} — best: {reduced_result['best_model_name']}  [{recall_tag}]")
+    print(f"  Features ({len(reduced_result['features'])}): {reduced_result['features']}")
+    print(f"  Chosen threshold : {reduced_result['threshold']:.4f}")
+    print(f"  target_recall    : {reduced_result['target_recall']}")
+    print(f"  Val recall       : {bs['val_rec']:.4f}   "
+          f"Val precision: {bs['val_prec']:.4f}   "
+          f"Val FP proportion: {bs['val_fp_prop']:.4f}")
+    print()
+    print(f"  Test-set results at threshold {reduced_result['threshold']:.4f}:")
+    print(f"  {'Metric':<16}  {'Value':>8}")
+    print("  " + "-" * 26)
+    print(f"  {'Recall':<16}  {bs['test_recall']:>8.4f}")
+    print(f"  {'Precision':<16}  {bs['test_precision']:>8.4f}")
+    print(f"  {'FP proportion':<16}  {bs['test_fp_prop']:>8.4f}")
+    print(f"  {'F1':<16}  {bs['test_f1']:>8.4f}")
+    print(f"  {'TP':<16}  {bs['test_tp']:>8d}")
+    print(f"  {'FP':<16}  {bs['test_fp']:>8d}")
+    print(f"  {'TN':<16}  {bs['test_tn']:>8d}")
+    print(f"  {'FN':<16}  {bs['test_fn']:>8d}")
+
+
+def _print_full_top10(full_results: list) -> None:
+    """Print the top-10 full-model candidates ranked by R²_high."""
+    valid_full = [
+        r for r in full_results
+        if not np.isnan(r.get('r2_high', float('nan')))
+    ]
+    top10 = sorted(valid_full, key=lambda x: x['r2_high'], reverse=True)[:10]
+    if not top10:
+        print("  No valid full-model results available.")
+        return
+    print(f"\nTop 10 full-model candidates  (ranked by R²_high ≥ {HIGH_THRESHOLD}):")
+    hdr = (f"  {'#':>3}  {'Model':<25}  {'KmerConfig':<28}  "
+           f"{'N':>4}  {'Type':<14}  "
+           f"{'R²':>8}  {'R²_high':>8}  {'MAE_high':>9}  {'RMSE_high':>10}")
+    print(hdr)
+    print("  " + "-" * 125)
+    for rank, res in enumerate(top10, 1):
+        ftype = res['feature_set_type'][:14]
+        print(
+            f"  {rank:>3}  {res['model_name']:<25}  {res['kmer_config']:<28}  "
+            f"{res['n_features']:>4}  {ftype:<14}  "
+            f"{res['test_r2']:>8.4f}  {res['r2_high']:>8.4f}  "
+            f"{res['mae_high']:>9.4f}  {res['rmse_high']:>10.4f}"
+        )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train pairwise regression models to predict percent identity."
@@ -1191,13 +1388,33 @@ def main() -> None:
         '--test-fraction',
         type=float,
         default=0.1,
-        help='Fraction of data held out for testing (default: 0.1).',
+        help='Fraction of full data held out for testing in Phase B (default: 0.1).',
     )
     parser.add_argument(
         '--seed',
         type=int,
         default=23,
         help='Random seed (default: 23).',
+    )
+    parser.add_argument(
+        '--subsample-size',
+        type=int,
+        default=SUBSAMPLE_SIZE,
+        help=f'Number of rows in the Phase-A comparison subsample '
+             f'(default: {SUBSAMPLE_SIZE:,}).',
+    )
+    parser.add_argument(
+        '--min-positive-frac',
+        type=float,
+        default=MIN_POSITIVE_FRAC,
+        help=f'Minimum fraction of positives (y >= {HIGH_THRESHOLD}) enforced '
+             f'in the subsample (default: {MIN_POSITIVE_FRAC}).',
+    )
+    parser.add_argument(
+        '--no-retrain',
+        action='store_true',
+        default=False,
+        help='Skip Phase B (do not retrain final models on the full dataset).',
     )
     args = parser.parse_args()
 
@@ -1206,22 +1423,156 @@ def main() -> None:
     print("=" * 70)
 
     # ------------------------------------------------------------------
-    # 1. Load data
+    # 1. Load data and expand features
     # ------------------------------------------------------------------
     print("\n1. Loading and preparing data...")
     X, y = load_and_prepare_data(args.input)
 
-    # ------------------------------------------------------------------
-    # 1b. Expand features (log + sqrt variants)
-    # ------------------------------------------------------------------
     print("\n1b. Expanding features (log and sqrt variants)...")
     X = expand_features(X)
     print(f"  Features after expansion: {X.shape[1]}")
 
     # ------------------------------------------------------------------
-    # 2. Train / test split
+    # 2. Base models (defined once; reused in both phases)
     # ------------------------------------------------------------------
-    print("\n2. Splitting into train / test sets...")
+    print("\n2. Defining base classifiers (reduced model) and regressors (full model)...")
+    base_classifiers = get_base_classifiers(seed=args.seed)
+    base_models      = get_base_regressors(seed=args.seed)
+    print(f"  {len(base_classifiers)} classifiers for reduced model: "
+          f"{[n for n, _ in base_classifiers]}")
+    print(f"  {len(base_models)} regressors for full model: "
+          f"{[n for n, _ in base_models]}")
+
+    # ======================================================================
+    # PHASE A: Fast model comparison on a fixed-size subsample
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("PHASE A: Fast model comparison on subsample")
+    print("=" * 70)
+    print(f"  Subsample size       : {args.subsample_size:,}")
+    print(f"  Min positive fraction: {args.min_positive_frac:.1%}")
+    print(f"  Subsample split      : 50 % train / 25 % val / 25 % test")
+
+    # A-1. Draw the subsample with the required positive fraction.
+    print(f"\nA-1. Drawing subsample...")
+    X_sub, y_sub = draw_subsample(
+        X, y,
+        subsample_size=args.subsample_size,
+        min_pos_frac=args.min_positive_frac,
+        seed=args.seed,
+    )
+    y_bin_sub = (y_sub.values >= HIGH_THRESHOLD).astype(int)
+    n_pos_sub = int(y_bin_sub.sum())
+    n_neg_sub = len(y_bin_sub) - n_pos_sub
+    print(f"  Subsample: {len(X_sub):,} rows total")
+    print(f"    Positives (y >= {HIGH_THRESHOLD}): {n_pos_sub:,}  "
+          f"({n_pos_sub / max(1, len(y_bin_sub)):.1%})")
+    print(f"    Negatives               : {n_neg_sub:,}  "
+          f"({n_neg_sub / max(1, len(y_bin_sub)):.1%})")
+
+    # A-2. 50 / 25 / 25 split of the subsample.
+    #      Pass the 75 % train+val portion as X_train to train_reduced_model
+    #      with val_fraction=1/3 so the internal fit/val split gives exactly
+    #      50 % / 25 % of the total subsample size.
+    n_sub = len(X_sub)
+    sub_test_size = max(1, int(n_sub * 0.25))
+    sub_rng  = np.random.default_rng(args.seed)
+    sub_perm = sub_rng.permutation(n_sub)
+    sub_test_idx  = sub_perm[:sub_test_size]
+    sub_train_idx = sub_perm[sub_test_size:]
+
+    X_sub_train = X_sub.iloc[sub_train_idx].reset_index(drop=True)
+    X_sub_test  = X_sub.iloc[sub_test_idx].reset_index(drop=True)
+    y_sub_train = y_sub.iloc[sub_train_idx].reset_index(drop=True)
+    y_sub_test  = y_sub.iloc[sub_test_idx].reset_index(drop=True)
+
+    y_bin_sub_train = (y_sub_train.values >= HIGH_THRESHOLD).astype(int)
+    y_bin_sub_test  = (y_sub_test.values  >= HIGH_THRESHOLD).astype(int)
+
+    print(f"\n  Subsample splits:")
+    print(f"    Train+Val (75 %): {len(X_sub_train):,}  "
+          f"({y_bin_sub_train.sum():,} pos = {y_bin_sub_train.mean():.1%})")
+    print(f"    Test      (25 %): {len(X_sub_test):,}  "
+          f"({y_bin_sub_test.sum():,} pos = {y_bin_sub_test.mean():.1%})")
+
+    # A-3. Scale the subsample (scaler fit on train portion only).
+    sub_scaler = StandardScaler()
+    X_sub_train_scaled = pd.DataFrame(
+        sub_scaler.fit_transform(X_sub_train),
+        columns=X_sub_train.columns,
+        index=X_sub_train.index,
+    )
+    X_sub_test_scaled = pd.DataFrame(
+        sub_scaler.transform(X_sub_test),
+        columns=X_sub_test.columns,
+        index=X_sub_test.index,
+    )
+
+    # A-4. Reduced model comparison on subsample.
+    print("\nA-4. Reduced model comparison on subsample "
+          f"(val_fraction={SUBSAMPLE_VAL_FRACTION:.3f} → 50/25/25 split)...")
+    reduced_result_phaseA = train_reduced_model(
+        X_sub_train_scaled, y_sub_train,
+        X_sub_test_scaled,  y_sub_test,
+        base_classifiers,
+        seed=args.seed,
+        val_fraction=SUBSAMPLE_VAL_FRACTION,
+    )
+
+    # A-5. Full model comparison on subsample.
+    print("\nA-5. Full model comparison on subsample...")
+    full_results_phaseA = train_full_models(
+        X_sub_train_scaled, y_sub_train,
+        X_sub_test_scaled,  y_sub_test,
+        base_models,
+        seed=args.seed,
+    )
+
+    # Determine the winning reduced-model configuration from Phase A.
+    if reduced_result_phaseA:
+        phaseA_clf_name  = reduced_result_phaseA['best_stats']['clf_name']
+        phaseA_n_feat    = reduced_result_phaseA['best_stats']['n_features']
+        phaseA_target_ok = reduced_result_phaseA.get('target_recall_met', False)
+        print(f"\n  Phase A winner: clf={phaseA_clf_name!r}  n_features={phaseA_n_feat}  "
+              f"target_recall_met={phaseA_target_ok}")
+    else:
+        phaseA_clf_name = None
+        phaseA_n_feat   = None
+        phaseA_target_ok = False
+        print("\n  *** Phase A: No valid reduced-model found. "
+              "Phase B will train all configurations. ***")
+
+    # Skip Phase B if requested.
+    if args.no_retrain:
+        print("\n--no-retrain specified: skipping Phase B.  Saving Phase-A results.")
+        save_reduced_model(args.output_dir, reduced_result_phaseA,
+                           feature_scaler=sub_scaler)
+        save_full_models(args.output_dir, full_results_phaseA,
+                         feature_scaler=sub_scaler)
+        save_results_csv(args.results, full_results_phaseA, reduced_result_phaseA)
+
+        print("\n" + "=" * 70)
+        print("SUMMARY  (Phase A only — no retrain)")
+        print("=" * 70)
+        _print_reduced_summary(
+            reduced_result_phaseA,
+            "Phase A — Reduced Model (subsample)",
+        )
+        _print_full_top10(full_results_phaseA)
+        print("\n" + "=" * 70)
+        print("TRAINING COMPLETE")
+        print("=" * 70)
+        return
+
+    # ======================================================================
+    # PHASE B: Retrain final models on the full dataset
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("PHASE B: Retrain final models on full dataset")
+    print("=" * 70)
+
+    # B-1. Full train / test split.
+    print("\nB-1. Splitting full dataset into train / test sets...")
     rng = np.random.default_rng(args.seed)
     n   = len(X)
     test_size  = int(n * args.test_fraction)
@@ -1234,14 +1585,15 @@ def main() -> None:
     y_train = y.iloc[train_idx].reset_index(drop=True)
     y_test  = y.iloc[test_idx].reset_index(drop=True)
 
-    print(f"  Train: {len(X_train):,}   Test: {len(X_test):,}")
-    print(f"  High-identity (≥{HIGH_THRESHOLD}) in test: "
-          f"{(y_test >= HIGH_THRESHOLD).sum():,}")
+    y_bin_train = (y_train.values >= HIGH_THRESHOLD).astype(int)
+    y_bin_test  = (y_test.values  >= HIGH_THRESHOLD).astype(int)
+    print(f"  Train: {len(X_train):,}  "
+          f"({y_bin_train.sum():,} pos = {y_bin_train.mean():.1%})")
+    print(f"  Test : {len(X_test):,}   "
+          f"({y_bin_test.sum():,} pos = {y_bin_test.mean():.1%})")
 
-    # ------------------------------------------------------------------
-    # 2b. Scale features (fit on train, apply to both)
-    # ------------------------------------------------------------------
-    print("\n2b. Scaling features (StandardScaler fit on training data only)...")
+    # B-2. Scale features (fit on train, apply to both).
+    print("\nB-2. Scaling features (StandardScaler fit on full training data)...")
     feature_scaler = StandardScaler()
     X_train_scaled = pd.DataFrame(
         feature_scaler.fit_transform(X_train),
@@ -1254,32 +1606,20 @@ def main() -> None:
         index=X_test.index,
     )
 
-    # ------------------------------------------------------------------
-    # 3. Base models
-    # ------------------------------------------------------------------
-    print("\n3. Defining base classifiers (reduced model) and regressors (full model)...")
-    base_classifiers = get_base_classifiers(seed=args.seed)
-    base_models      = get_base_regressors(seed=args.seed)
-    print(f"  {len(base_classifiers)} classifiers for reduced model: "
-          f"{[n for n, _ in base_classifiers]}")
-    print(f"  {len(base_models)} regressors for full model: "
-          f"{[n for n, _ in base_models]}")
-
-    # ------------------------------------------------------------------
-    # 4. Reduced model
-    # ------------------------------------------------------------------
-    print("\n4. Training reduced model (binary classifier, GC/Length/Quality only)...")
+    # B-3. Retrain reduced model on full data using Phase-A winning config.
+    print("\nB-3. Retraining reduced model on full dataset "
+          "(threshold re-tuned on validation split)...")
     reduced_result = train_reduced_model(
         X_train_scaled, y_train,
         X_test_scaled,  y_test,
         base_classifiers,
         seed=args.seed,
+        clf_filter=phaseA_clf_name,
+        n_feat_filter=phaseA_n_feat,
     )
 
-    # ------------------------------------------------------------------
-    # 5. Full model experiments (per kmer config)
-    # ------------------------------------------------------------------
-    print("\n5. Training full models (per kmer configuration)...")
+    # B-4. Retrain full models on full dataset.
+    print("\nB-4. Retraining full models on full dataset...")
     full_results = train_full_models(
         X_train_scaled, y_train,
         X_test_scaled,  y_test,
@@ -1287,68 +1627,32 @@ def main() -> None:
         seed=args.seed,
     )
 
-    # ------------------------------------------------------------------
-    # 6. Save artefacts
-    # ------------------------------------------------------------------
-    print("\n6. Saving models and results...")
+    # B-5. Save final artefacts.
+    print("\nB-5. Saving final models and results...")
     save_reduced_model(args.output_dir, reduced_result, feature_scaler=feature_scaler)
     save_full_models(args.output_dir, full_results, feature_scaler=feature_scaler)
     save_results_csv(args.results, full_results, reduced_result)
 
-    # ------------------------------------------------------------------
-    # 7. Summary
-    # ------------------------------------------------------------------
+    # ======================================================================
+    # SUMMARY
+    # ======================================================================
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
 
-    # Reduced model classifier table
-    if reduced_result:
-        bs = reduced_result['best_stats']
-        print(f"\nReduced Model (binary classifier) — best: "
-              f"{reduced_result['best_model_name']}")
-        print(f"  Features ({len(reduced_result['features'])}): "
-              f"{reduced_result['features']}")
-        print(f"  Chosen threshold : {reduced_result['threshold']:.4f}")
-        print(f"  target_recall    : {reduced_result['target_recall']}")
-        print(f"  Val recall       : {bs['val_rec']:.4f}   "
-              f"Val precision: {bs['val_prec']:.4f}   "
-              f"Val FP proportion: {bs['val_fp_prop']:.4f}")
-        print()
-        print(f"  Test-set results at threshold {reduced_result['threshold']:.4f}:")
-        print(f"  {'Metric':<16}  {'Value':>8}")
-        print("  " + "-" * 26)
-        print(f"  {'Recall':<16}  {bs['test_recall']:>8.4f}")
-        print(f"  {'Precision':<16}  {bs['test_precision']:>8.4f}")
-        print(f"  {'FP proportion':<16}  {bs['test_fp_prop']:>8.4f}")
-        print(f"  {'F1':<16}  {bs['test_f1']:>8.4f}")
-        print(f"  {'TP':<16}  {bs['test_tp']:>8d}")
-        print(f"  {'FP':<16}  {bs['test_fp']:>8d}")
-        print(f"  {'TN':<16}  {bs['test_tn']:>8d}")
-        print(f"  {'FN':<16}  {bs['test_fn']:>8d}")
+    print("\n--- Phase A: subsample comparison ---")
+    _print_reduced_summary(
+        reduced_result_phaseA,
+        "Phase A — Reduced Model (subsample)",
+    )
+    _print_full_top10(full_results_phaseA)
 
-    # Top-10 full models table
-    valid_full = [
-        r for r in full_results
-        if not np.isnan(r.get('r2_high', float('nan')))
-    ]
-    top10 = sorted(valid_full, key=lambda x: x['r2_high'], reverse=True)[:10]
-
-    if top10:
-        print(f"\nTop 10 full-model candidates  (ranked by R²_high ≥ {HIGH_THRESHOLD}):")
-        hdr = (f"  {'#':>3}  {'Model':<25}  {'KmerConfig':<28}  "
-               f"{'N':>4}  {'Type':<14}  "
-               f"{'R²':>8}  {'R²_high':>8}  {'MAE_high':>9}  {'RMSE_high':>10}")
-        print(hdr)
-        print("  " + "-" * 125)
-        for rank, res in enumerate(top10, 1):
-            ftype = res['feature_set_type'][:14]
-            print(
-                f"  {rank:>3}  {res['model_name']:<25}  {res['kmer_config']:<28}  "
-                f"{res['n_features']:>4}  {ftype:<14}  "
-                f"{res['test_r2']:>8.4f}  {res['r2_high']:>8.4f}  "
-                f"{res['mae_high']:>9.4f}  {res['rmse_high']:>10.4f}"
-            )
+    print("\n--- Phase B: full-dataset final models ---")
+    _print_reduced_summary(
+        reduced_result,
+        "Phase B — Reduced Model (full dataset)",
+    )
+    _print_full_top10(full_results)
 
     print("\n" + "=" * 70)
     print("TRAINING COMPLETE")
@@ -1357,3 +1661,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

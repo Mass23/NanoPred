@@ -110,6 +110,11 @@ KMER_PREFIX    = "kmer"
 SUBSAMPLE_SIZE    = 100_000
 MIN_POSITIVE_FRAC = 0.10
 
+# val_fraction used when calling train_reduced_model on the 75 % train+val
+# portion of the 100 k subsample so that the overall split is 50/25/25.
+# 25 k val / 75 k train+val = 1/3.
+SUBSAMPLE_VAL_FRACTION = 1 / 3
+
 
 # =========================================================
 # DATA LOADING AND PREPARATION
@@ -209,16 +214,16 @@ def draw_subsample(
         # Not enough positives naturally; oversample to reach min_pos_frac.
         n_pos_target = n_pos_min
         n_neg_target = n_sub - n_pos_target
-        replace_pos = n_pos_target > n_pos_natural
-        if replace_pos:
+        replace_with_replacement_pos = n_pos_target > n_pos_natural
+        if replace_with_replacement_pos:
             print(f"  NOTE: Oversampling positives with replacement "
                   f"({n_pos_natural:,} available, {n_pos_target:,} needed).")
-        sampled_pos = rng.choice(pos_idx, size=n_pos_target, replace=replace_pos)
-        replace_neg = n_neg_target > n_neg_natural
-        if replace_neg:
+        sampled_pos = rng.choice(pos_idx, size=n_pos_target, replace=replace_with_replacement_pos)
+        replace_with_replacement_neg = n_neg_target > n_neg_natural
+        if replace_with_replacement_neg:
             print(f"  NOTE: Oversampling negatives with replacement "
                   f"({n_neg_natural:,} available, {n_neg_target:,} needed).")
-        sampled_neg = rng.choice(neg_idx, size=n_neg_target, replace=replace_neg)
+        sampled_neg = rng.choice(neg_idx, size=n_neg_target, replace=replace_with_replacement_neg)
 
     chosen_idx = np.concatenate([sampled_pos, sampled_neg])
     rng.shuffle(chosen_idx)
@@ -1505,13 +1510,13 @@ def main() -> None:
 
     # A-4. Reduced model comparison on subsample.
     print("\nA-4. Reduced model comparison on subsample "
-          "(val_fraction=1/3 → 50/25/25 split)...")
+          f"(val_fraction={SUBSAMPLE_VAL_FRACTION:.3f} → 50/25/25 split)...")
     reduced_result_phaseA = train_reduced_model(
         X_sub_train_scaled, y_sub_train,
         X_sub_test_scaled,  y_sub_test,
         base_classifiers,
         seed=args.seed,
-        val_fraction=1 / 3,
+        val_fraction=SUBSAMPLE_VAL_FRACTION,
     )
 
     # A-5. Full model comparison on subsample.

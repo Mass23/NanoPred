@@ -280,7 +280,7 @@ def quality_hash(quality_scores: list, num_bits: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# K-mer spectrum (explicit fixed vocabulary, comparable across sequences)
+# K-mer presence sketching
 # ---------------------------------------------------------------------------
 
 def _build_kmer_vocabulary(k: int) -> dict:
@@ -288,56 +288,57 @@ def _build_kmer_vocabulary(k: int) -> dict:
     return {''.join(p): i for i, p in enumerate(itertools.product('ACGT', repeat=k))}
 
 
-# Pre-built vocabularies for k = 3 (64), 4 (256), 5 (1024)
-_KMER_VOCABULARIES: dict[int, dict[str, int]] = {k: _build_kmer_vocabulary(k) for k in (3, 4, 5)}
+# Pre-built vocabularies for k = 3 (64 entries) and k = 5 (1024 entries)
+_KMER_VOCABULARIES: dict[int, dict[str, int]] = {k: _build_kmer_vocabulary(k) for k in (3, 5)}
 
 
-def kmer_spectrum(seq: str, k: int) -> np.ndarray:
-    """
-    Compute the k-mer count spectrum for *seq* using a fixed ACGT vocabulary.
+def _splitmix64(x: int) -> int:
+    """SplitMix64 hash mixer — fast deterministic 64-bit hash with good avalanche."""
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9
+    x &= 0xFFFFFFFFFFFFFFFF
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EB
+    x &= 0xFFFFFFFFFFFFFFFF
+    x ^= x >> 31
+    return x & 0xFFFFFFFFFFFFFFFF
 
-    Returns a uint16 array of length 4^k indexed by the fixed vocabulary so
-    that spectra from different sequences are directly comparable.
 
-    dtype=uint16 (max 65535) is used instead of uint8 (max 255) because a
-    3-mer can occur up to ~len(seq) times; for sequences up to 2000 bp the
-    most common 3-mer can appear ~670 times, well within uint16 range but
-    potentially overflowing uint8.  uint16 is safe for sequences up to ~65535
-    bp and adds negligible memory overhead over uint8.
+def kmer_presence_sketch(seq: str, k: int, num_bits: int, hashes_per_kmer: int = 2) -> np.ndarray:
+    """Compute a hashed presence sketch (bitset) for the k-mer spectrum of *seq*.
+
+    For each distinct k-mer present in *seq*, ``hashes_per_kmer`` bit positions
+    are derived from the k-mer's vocabulary index using the SplitMix64 mixer and
+    set to 1.  The resulting ``num_bits``-element uint8 array is a compact,
+    fixed-size representation of the k-mer presence set.
+
+    Jaccard similarity between two such sketches approximates set Jaccard on the
+    underlying k-mer presence sets and can be computed in O(num_bits) time,
+    independent of sequence length or vocabulary size.
+
+    Args:
+        seq:            DNA sequence string.
+        k:              k-mer length.  Must be 3 or 5 (values in _KMER_VOCABULARIES).
+        num_bits:       Sketch size in bits (e.g. 64, 128, 256, 512).
+        hashes_per_kmer: Number of bit positions set per present k-mer (default 2).
+
+    Returns:
+        uint8 array of length *num_bits* (each element 0 or 1).
+
+    Raises:
+        KeyError: If *k* is not a supported vocabulary size (currently 3 or 5).
     """
     vocab = _KMER_VOCABULARIES[k]
-    counts = np.zeros(len(vocab), dtype=np.uint16)
-    seq = seq.upper()
-    for i in range(len(seq) - k + 1):
-        kmer = seq[i:i + k]
-        idx = vocab.get(kmer)
+    sketch = np.zeros(num_bits, dtype=np.uint8)
+    seq_upper = seq.upper()
+    present: set[int] = set()
+    for i in range(len(seq_upper) - k + 1):
+        idx = vocab.get(seq_upper[i:i + k])
         if idx is not None:
-            counts[idx] += 1
-    return counts
-
-
-def kmer_jaccard(counts1: np.ndarray, counts2: np.ndarray, weighted: bool = False) -> float:
-    """
-    Compute Jaccard similarity between two k-mer count spectra.
-
-    weighted=False (default):
-        Set/presence Jaccard — treats each k-mer as present or absent.
-        J = |A ∩ B| / |A ∪ B|  where A, B are the sets of observed k-mers.
-
-    weighted=True:
-        Count-based (weighted) Jaccard.
-        J = Σ min(c1, c2) / Σ max(c1, c2)
-    """
-    if weighted:
-        intersection = float(np.sum(np.minimum(counts1, counts2)))
-        union = float(np.sum(np.maximum(counts1, counts2)))
-        return intersection / union if union > 0 else 0.0
-    else:
-        p1 = counts1 > 0
-        p2 = counts2 > 0
-        intersection = float(np.sum(p1 & p2))
-        union = float(np.sum(p1 | p2))
-        return intersection / union if union > 0 else 0.0
+            present.add(idx)
+    for idx in present:
+        for s in range(hashes_per_kmer):
+            h = _splitmix64(idx + s * 0x9E3779B97F4A7C15)
+            sketch[h % num_bits] = 1
+    return sketch
 
 # ---------------------------------------------------------------------------
 # Metrics computation
@@ -351,10 +352,9 @@ def compute_metrics(seq: str, quality_scores: list) -> dict:
     - length
     - quality_mean, quality_median, quality_q25, quality_q75
     - gc_content
-    - quality_hash_64/128/256
-    - kmer_3_spectrum, kmer_4_spectrum, kmer_5_spectrum
-      (uint16 arrays indexed by fixed ACGT vocabulary; use kmer_jaccard() for
-      both non-weighted and weighted Jaccard in compute_pair_features)
+    - quality_hash_64/128/256  (bitset sketches)
+    - kmer_{k}_sketch_{b}  for k in {3,5}, b in {64,128,256,512}
+      (hashed presence bitset sketches; use jaccard_similarity() for pair comparison)
     """
     metrics = {}
 
@@ -382,9 +382,10 @@ def compute_metrics(seq: str, quality_scores: list) -> dict:
     for bits in (64, 128, 256):
         metrics[f'quality_hash_{bits}'] = quality_hash(quality_scores, bits)
 
-    # k-mer count spectra (fixed vocabulary, comparable across sequences)
-    for k in (3, 4, 5):
-        metrics[f'kmer_{k}_spectrum'] = kmer_spectrum(seq, k)
+    # k-mer presence sketches (hashed bitsets; k=3 and k=5, four sketch sizes)
+    for k in (3, 5):
+        for bits in (64, 128, 256, 512):
+            metrics[f'kmer_{k}_sketch_{bits}'] = kmer_presence_sketch(seq, k, bits)
 
     return metrics
 
@@ -419,11 +420,11 @@ def _scalar_features(name: str, v1: float, v2: float) -> dict:
 def compute_pair_features(m1: dict, m2: dict) -> dict:
     """
     Compute pair-wise features from two metric dicts.
-    Returns flat feature dict (no hash arrays, only scalars).
+    Returns flat feature dict (no sketch arrays, only scalars).
 
     K-mer features:
-      kmer_{k}_jaccard          — non-weighted (set/presence) Jaccard for k=3,4,5
-      kmer_{k}_jaccard_weighted — count-based weighted Jaccard for k=3,4,5
+      kmer_{k}_hashjaccard_{b} — Jaccard on hashed presence sketches for
+                                  k in {3,5}, b in {64,128,256,512}
     """
     features = {}
 
@@ -441,12 +442,12 @@ def compute_pair_features(m1: dict, m2: dict) -> dict:
         b = m2[f'quality_hash_{bits}']
         features[f'quality_jaccard_{bits}'] = jaccard_similarity(a, b)
 
-    # K-mer spectrum Jaccard (non-weighted and weighted)
-    for k in (3, 4, 5):
-        s1 = m1[f'kmer_{k}_spectrum']
-        s2 = m2[f'kmer_{k}_spectrum']
-        features[f'kmer_{k}_jaccard'] = kmer_jaccard(s1, s2, weighted=False)
-        features[f'kmer_{k}_jaccard_weighted'] = kmer_jaccard(s1, s2, weighted=True)
+    # K-mer hashed presence sketch Jaccard
+    for k in (3, 5):
+        for bits in (64, 128, 256, 512):
+            a = m1[f'kmer_{k}_sketch_{bits}']
+            b = m2[f'kmer_{k}_sketch_{bits}']
+            features[f'kmer_{k}_hashjaccard_{bits}'] = jaccard_similarity(a, b)
 
     return features
 

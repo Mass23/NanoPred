@@ -4,7 +4,7 @@ train_model.py - Simplified two-model training workflow for NanoPred.
 Workflow overview:
   1) FAST MODEL candidate search (binary classification, <85 vs >=85):
      - Build a balanced 10,000-row candidate-search subset.
-     - Generate 200 random candidates.
+     - Generate 500 random candidates.
      - Each candidate picks:
          * one classifier from get_base_classifiers()
          * exactly 5 random GC/length/quality features (no kmer features)
@@ -20,7 +20,7 @@ Workflow overview:
 
   3) FULL MODEL candidate search (regression, 85 <= y <= 100):
      - Build a 10,000-row candidate-search subset from the high-identity rows.
-     - Generate 200 random candidates.
+     - Generate 500 random candidates.
      - Each candidate picks:
          * one regressor from get_base_regressors()
          * exactly 10 random features
@@ -30,7 +30,9 @@ Workflow overview:
 
   4) FULL MODEL final retraining:
      - Restrict data to 85 <= y <= 100.
-     - Train/test split with 10% holdout.
+     - Draw a homogeneously-balanced training set (up to 200,000 data points)
+       and a separate homogeneously-balanced validation set (10,000 data points),
+       with samples distributed uniformly across the 85–100 identity range.
      - Retrain the winning full-model configuration.
 
 Outputs (saved under final_models/ by default):
@@ -69,12 +71,15 @@ TARGET_RECALL = 0.99
 
 FAST_CANDIDATE_SUBSET_SIZE = 10_000
 FULL_CANDIDATE_SUBSET_SIZE = 10_000
-N_RANDOM_CANDIDATES = 200
+N_RANDOM_CANDIDATES = 500
 
 FAST_FEATURE_COUNT = 5
 FULL_FEATURE_COUNT = 10
 
 TEST_FRACTION = 0.10
+
+FULL_RETRAIN_MAX_TRAIN = 200_000   # cap on training rows for the full model final retrain
+FULL_RETRAIN_VAL_SIZE  = 10_000    # fixed validation set size for the full model final retrain
 
 GC_PREFIX = "gc"
 LENGTH_PREFIX = "length"
@@ -486,6 +491,67 @@ def split_regression_train_test(
     )
 
 
+def _draw_homogeneous_full_subset(
+    y_vals: np.ndarray,
+    n: int,
+    low: float,
+    high: float,
+    seed: int,
+    n_bins: int = 15,
+) -> np.ndarray:
+    """
+    Draw n row indices from y_vals, distributed uniformly across n_bins equal-width
+    bins spanning [low, high].
+
+    Args:
+        y_vals:  1-D array of target values (e.g., percent identity) to bin.
+        n:       Total number of indices to return.
+        low:     Lower bound of the sampling range (inclusive).
+        high:    Upper bound of the sampling range (inclusive).
+        seed:    Random seed for reproducibility.
+        n_bins:  Number of equal-width bins to divide [low, high] into.
+                 Only bins that contain at least one row are considered "active".
+
+    Returns:
+        1-D integer array of length n containing row indices into y_vals.
+        Each active bin receives floor(n / n_active) indices; any remainder
+        is distributed one-per-bin starting from the first active bin.
+        Sampling within a bin uses replacement only when the bin contains
+        fewer rows than the per-bin quota.
+    """
+    rng = np.random.default_rng(seed)
+    bin_edges = np.linspace(low, high, n_bins + 1)
+
+    # Collect indices per bin
+    bins: List[np.ndarray] = []
+    for i in range(n_bins):
+        b_low, b_high = bin_edges[i], bin_edges[i + 1]
+        if i == n_bins - 1:
+            mask = (y_vals >= b_low) & (y_vals <= b_high)
+        else:
+            mask = (y_vals >= b_low) & (y_vals < b_high)
+        idx = np.where(mask)[0]
+        if len(idx) > 0:
+            bins.append(idx)
+
+    if not bins:
+        raise ValueError(f"No data in range [{low}, {high}] for homogeneous sampling.")
+
+    n_active = len(bins)
+    base = n // n_active
+    extra = n % n_active
+
+    chosen: List[np.ndarray] = []
+    for i, bin_idx in enumerate(bins):
+        n_bin = base + (1 if i < extra else 0)
+        replace = n_bin > len(bin_idx)
+        chosen.append(rng.choice(bin_idx, size=n_bin, replace=replace))
+
+    result = np.concatenate(chosen)
+    rng.shuffle(result)
+    return result
+
+
 # =========================================================
 # RANDOM CANDIDATE HELPERS
 # =========================================================
@@ -708,29 +774,57 @@ def retrain_full_model(
     X: pd.DataFrame,
     y: pd.Series,
     winner: Dict,
-    test_fraction: float,
     seed: int,
 ) -> Dict:
-    """Retrain winning full-model configuration on full 85–100 dataset split."""
+    """Retrain winning full-model configuration on a capped, homogeneously-balanced 85–100 split.
+
+    Training is capped at FULL_RETRAIN_MAX_TRAIN (200,000) rows; validation uses a
+    separate FULL_RETRAIN_VAL_SIZE (10,000) row set.  Both sets are drawn with
+    uniform coverage across the 85–100 identity range.
+    """
     mask = (y.values >= HIGH_THRESHOLD) & (y.values <= 100.0)
-    X_hi = X.iloc[np.where(mask)[0]].reset_index(drop=True)
-    y_hi = y.iloc[np.where(mask)[0]].reset_index(drop=True)
-    if len(X_hi) < 2:
+    all_hi_idx = np.where(mask)[0]
+    if len(all_hi_idx) < 2:
         raise ValueError("Need at least 2 rows in 85–100 range for full-model retraining.")
 
-    X_train, y_train, X_test, y_test = split_regression_train_test(
-        X_hi,
-        y_hi,
-        test_fraction=test_fraction,
-        seed=seed,
+    X_hi = X.iloc[all_hi_idx].reset_index(drop=True)
+    y_hi = y.iloc[all_hi_idx].reset_index(drop=True)
+
+    # Draw homogeneous validation set first so it is excluded from training.
+    # Cap at half the available data so there is always room for a training set.
+    n_val = min(FULL_RETRAIN_VAL_SIZE, max(1, len(all_hi_idx) // 2))
+    val_local_idx = _draw_homogeneous_full_subset(
+        y_hi.values, n_val, HIGH_THRESHOLD, 100.0, seed=seed,
     )
+    # Exclude every original row that appears in the validation draw from the
+    # training pool.  np.unique handles the rare case where _draw_homogeneous_full_subset
+    # used within-bin replacement (possible only when a bin has very few rows).
+    val_unique = np.unique(val_local_idx)
+    remaining_local = np.setdiff1d(np.arange(len(y_hi)), val_unique)
+
+    X_remaining = X_hi.iloc[remaining_local].reset_index(drop=True)
+    y_remaining = y_hi.iloc[remaining_local].reset_index(drop=True)
+
+    # Draw homogeneous training set from the remaining pool.
+    n_train = min(FULL_RETRAIN_MAX_TRAIN, len(remaining_local))
+    train_local_idx = _draw_homogeneous_full_subset(
+        y_remaining.values, n_train, HIGH_THRESHOLD, 100.0, seed=seed + 1,
+    )
+
+    X_train = X_remaining.iloc[train_local_idx].reset_index(drop=True)
+    y_train = y_remaining.iloc[train_local_idx].reset_index(drop=True)
+    X_val = X_hi.iloc[val_local_idx].reset_index(drop=True)
+    y_val = y_hi.iloc[val_local_idx].reset_index(drop=True)
+
+    print(f"  Full model retrain — train: {len(y_train):,} | test: {len(y_val):,} "
+          f"(high-identity pool: {len(all_hi_idx):,})")
 
     model = clone(winner['model_obj'])
     features = winner['features']
     model.fit(X_train[features], y_train.values)
 
     train_pred = model.predict(X_train[features])
-    test_pred = model.predict(X_test[features])
+    val_pred = model.predict(X_val[features])
 
     return {
         'model': model,
@@ -738,11 +832,11 @@ def retrain_full_model(
         'features': features,
         'selection_metric': 'heldout_rmse_85_100',
         'train_metrics': compute_regression_metrics(y_train.values, train_pred),
-        'test_metrics': compute_regression_metrics(y_test.values, test_pred),
+        'test_metrics': compute_regression_metrics(y_val.values, val_pred),
         'dataset_summary': {
-            'full_high_identity_total': int(len(y_hi)),
+            'full_high_identity_total': int(len(all_hi_idx)),
             'train_total': int(len(y_train)),
-            'test_total': int(len(y_test)),
+            'test_total': int(len(y_val)),
             'target_range': [85.0, 100.0],
         },
     }
@@ -846,7 +940,7 @@ def main() -> None:
         '--n-candidates',
         type=int,
         default=N_RANDOM_CANDIDATES,
-        help='Number of random candidates to evaluate per model type (default: 200).',
+        help='Number of random candidates to evaluate per model type (default: 500).',
     )
     args = parser.parse_args()
 
@@ -884,6 +978,8 @@ def main() -> None:
     y_fast_train = y_fast_sub.iloc[train_idx].reset_index(drop=True)
     X_fast_eval = X_fast_sub.iloc[eval_idx].reset_index(drop=True)
     y_fast_eval = y_fast_sub.iloc[eval_idx].reset_index(drop=True)
+
+    print(f"  Candidate subset: {len(X_fast_sub):,} total | train: {len(X_fast_train):,} | eval: {len(X_fast_eval):,}")
 
     fast_feature_pool = get_columns_by_prefix(X, [GC_PREFIX, LENGTH_PREFIX, QUALITY_PREFIX])
     if len(fast_feature_pool) < FAST_FEATURE_COUNT:
@@ -936,6 +1032,8 @@ def main() -> None:
         seed=args.seed,
     )
 
+    print(f"  Candidate subset: {len(X_full_sub):,} total | train: {len(X_full_train):,} | eval: {len(X_full_eval):,}")
+
     full_feature_pool = X.columns.tolist()
     full_kmer_pool = [c for c in full_feature_pool if get_feature_prefix(base_name(c)) == KMER_PREFIX]
     if len(full_feature_pool) < FULL_FEATURE_COUNT:
@@ -984,7 +1082,6 @@ def main() -> None:
         X,
         y,
         winner=full_winner,
-        test_fraction=args.test_fraction,
         seed=args.seed,
     )
 

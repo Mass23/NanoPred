@@ -16,7 +16,8 @@ Workflow overview:
      - Use all datapoints to build a balanced (<85 vs >=85) dataset
        (oversampling the minority class if needed).
      - Hold out a balanced 10% test split.
-     - Train the winning configuration on the remaining balanced train split.
+     - Cap the training set to at most 500,000 rows while preserving class balance.
+     - Train the winning configuration on the capped balanced train split.
 
   3) FULL MODEL candidate search (regression, 85 <= y <= 100):
      - Build a 10,000-row candidate-search subset from the high-identity rows.
@@ -30,7 +31,7 @@ Workflow overview:
 
   4) FULL MODEL final retraining:
      - Restrict data to 85 <= y <= 100.
-     - Draw a homogeneously-balanced training set (up to 200,000 data points)
+     - Draw a homogeneously-balanced training set (up to 500,000 data points)
        and a separate homogeneously-balanced validation set (10,000 data points),
        with samples distributed uniformly across the 85–100 identity range.
      - Retrain the winning full-model configuration.
@@ -78,6 +79,7 @@ FULL_FEATURE_COUNT = 18
 
 TEST_FRACTION = 0.10
 
+FAST_RETRAIN_MAX_TRAIN = 500_000   # cap on training rows for the fast model final retrain
 FULL_RETRAIN_MAX_TRAIN = 500_000   # cap on training rows for the full model final retrain
 FULL_RETRAIN_VAL_SIZE  = 10_000    # fixed validation set size for the full model final retrain
 
@@ -732,6 +734,43 @@ def evaluate_and_select_full_candidate(
 # FINAL RETRAINING
 # =========================================================
 
+def _cap_fast_train_balanced(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    threshold: float,
+    max_train: int,
+    seed: int,
+) -> Tuple[pd.DataFrame, pd.Series]:
+    """Cap the fast-model training set to at most max_train rows while preserving class balance.
+
+    Rows are selected by taking equal halves from the <threshold and >=threshold classes.
+    If one class has fewer than max_train // 2 rows, all of its rows are kept and the
+    remaining budget is not redistributed to the other class, preserving balance.
+    """
+    if len(X_train) <= max_train:
+        return X_train, y_train
+
+    rng = np.random.default_rng(seed)
+    y_bin = (y_train.values >= threshold).astype(int)
+    pos_idx = np.where(y_bin == 1)[0]
+    neg_idx = np.where(y_bin == 0)[0]
+
+    per_class = max_train // 2
+    pos_take = min(len(pos_idx), per_class)
+    neg_take = min(len(neg_idx), per_class)
+
+    pos_sel = rng.choice(pos_idx, size=pos_take, replace=False)
+    neg_sel = rng.choice(neg_idx, size=neg_take, replace=False)
+
+    chosen = np.concatenate([pos_sel, neg_sel])
+    rng.shuffle(chosen)
+
+    return (
+        X_train.iloc[chosen].reset_index(drop=True),
+        y_train.iloc[chosen].reset_index(drop=True),
+    )
+
+
 def retrain_fast_model(
     X: pd.DataFrame,
     y: pd.Series,
@@ -739,7 +778,11 @@ def retrain_fast_model(
     test_fraction: float,
     seed: int,
 ) -> Dict:
-    """Retrain winning fast-model configuration on full balanced binary data."""
+    """Retrain winning fast-model configuration on full balanced binary data.
+
+    Training is capped at FAST_RETRAIN_MAX_TRAIN (500,000) rows while preserving
+    the <85 vs >=85 class balance.
+    """
     X_train, y_train, X_test, y_test, balance_summary = draw_fast_final_balanced_split(
         X,
         y,
@@ -747,6 +790,16 @@ def retrain_fast_model(
         threshold=HIGH_THRESHOLD,
         seed=seed,
     )
+
+    X_train, y_train = _cap_fast_train_balanced(
+        X_train,
+        y_train,
+        threshold=HIGH_THRESHOLD,
+        max_train=FAST_RETRAIN_MAX_TRAIN,
+        seed=seed,
+    )
+
+    print(f"  Fast model retrain — train: {len(y_train):,} | test: {len(y_test):,}")
 
     y_train_bin = (y_train.values >= HIGH_THRESHOLD).astype(int)
     y_test_bin = (y_test.values >= HIGH_THRESHOLD).astype(int)
@@ -786,7 +839,7 @@ def retrain_full_model(
 ) -> Dict:
     """Retrain winning full-model configuration on a capped, homogeneously-balanced 85–100 split.
 
-    Training is capped at FULL_RETRAIN_MAX_TRAIN (100,000) rows; validation uses a
+    Training is capped at FULL_RETRAIN_MAX_TRAIN (500,000) rows; validation uses a
     separate FULL_RETRAIN_VAL_SIZE (10,000) row set.  Both sets are drawn with
     uniform coverage across the 85–100 identity range.
     """

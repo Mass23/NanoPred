@@ -12,11 +12,13 @@ Workflow overview:
        on held-out selection data.
        Fallback if none satisfy recall > 0.99: highest recall, then precision.
 
-  2) FAST MODEL final retraining:
+  2) FAST MODEL winner refinement + final retraining:
+     - Refine the initial winner on a balanced 100,000-row subset by testing
+       local numeric hyperparameter multipliers: 0.75x, 0.875x, 1.0x, 1.125x, 1.25x.
      - Use all datapoints to build a balanced (<85 vs >=85) dataset
        (oversampling the minority class if needed).
      - Hold out a balanced 10% test split.
-     - Cap the training set to at most 500,000 rows while preserving class balance.
+     - Cap the training set to at most 1,000,000 rows while preserving class balance.
      - Train the winning configuration on the capped balanced train split.
 
   3) FULL MODEL candidate search (regression, 85 <= y <= 100):
@@ -26,12 +28,17 @@ Workflow overview:
          * one regressor from get_base_regressors()
          * exactly 10 random features
          * feature set must include at least one kmer feature
+         * kmer features must all use exactly one chosen k value
+           (e.g. k=3, k=5, or k=7), while allowing multiple hash sizes for that k
      - Winner metric: lowest held-out RMSE on the high-identity subset
        (tie-breaks: higher R², then lower MAE).
 
-  4) FULL MODEL final retraining:
+  4) FULL MODEL winner refinement + final retraining:
+     - Refine the initial winner on a homogeneous 100,000-row 85–100 subset by
+       testing local numeric hyperparameter multipliers:
+       0.75x, 0.875x, 1.0x, 1.125x, 1.25x.
      - Restrict data to 85 <= y <= 100.
-     - Draw a homogeneously-balanced training set (up to 500,000 data points)
+     - Draw a homogeneously-balanced training set (up to 1,000,000 data points)
        and a separate homogeneously-balanced validation set (10,000 data points),
        with samples distributed uniformly across the 85–100 identity range.
      - Retrain the winning full-model configuration.
@@ -47,7 +54,7 @@ import argparse
 import json
 import os
 import random as rnd
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -79,9 +86,11 @@ FULL_FEATURE_COUNT = 18
 
 TEST_FRACTION = 0.10
 
-FAST_RETRAIN_MAX_TRAIN = 500_000   # cap on training rows for the fast model final retrain
-FULL_RETRAIN_MAX_TRAIN = 500_000   # cap on training rows for the full model final retrain
+FAST_RETRAIN_MAX_TRAIN = 1_000_000   # cap on training rows for the fast model final retrain
+FULL_RETRAIN_MAX_TRAIN = 1_000_000   # cap on training rows for the full model final retrain
 FULL_RETRAIN_VAL_SIZE  = 10_000    # fixed validation set size for the full model final retrain
+REFINEMENT_SUBSET_SIZE = 100_000   # subset size used for winner-local hyperparameter refinement
+REFINEMENT_MULTIPLIERS = (0.75, 0.875, 1.0, 1.125, 1.25)
 
 GC_PREFIX = "gc"
 LENGTH_PREFIX = "length"
@@ -158,6 +167,20 @@ def get_feature_prefix(base_feature: str) -> str:
 
 def get_columns_by_prefix(X: pd.DataFrame, allowed_prefixes: List[str]) -> List[str]:
     return [c for c in X.columns if get_feature_prefix(base_name(c)) in allowed_prefixes]
+
+
+def extract_kmer_k(base_feature: str) -> Optional[int]:
+    """Extract k from a kmer feature named with a numeric suffix pattern like *_5_64."""
+    if get_feature_prefix(base_feature) != KMER_PREFIX:
+        return None
+    tokens = base_feature.split("_")
+    if len(tokens) < 3:
+        return None
+    try:
+        # Naming convention: ..._<k>_<hash_size>
+        return int(tokens[-2])
+    except ValueError:
+        return None
 
 
 # =========================================================
@@ -620,6 +643,54 @@ def generate_random_candidates(
     return candidates
 
 
+def generate_random_full_candidates_single_k(
+    models: List[Tuple[str, object]],
+    feature_pool: List[str],
+    n_features: int,
+    n_candidates: int,
+    seed: int,
+) -> List[Dict]:
+    """Generate full-model candidates constrained to exactly one chosen k value."""
+    rng = rnd.Random(seed)
+
+    non_kmer_pool = [f for f in feature_pool if get_feature_prefix(base_name(f)) != KMER_PREFIX]
+    kmer_groups: Dict[int, List[str]] = {}
+    for feature in feature_pool:
+        base = base_name(feature)
+        k_val = extract_kmer_k(base)
+        if k_val is not None:
+            kmer_groups.setdefault(k_val, []).append(feature)
+
+    valid_k_values = [
+        k_val
+        for k_val, k_features in kmer_groups.items()
+        if len(non_kmer_pool) + len(k_features) >= n_features and len(k_features) > 0
+    ]
+    if not valid_k_values:
+        raise ValueError("Full model requires kmer features grouped by k, but no valid k groups were found.")
+
+    candidates: List[Dict] = []
+    for candidate_id in range(n_candidates):
+        model_name, model = rng.choice(models)
+        chosen_k = rng.choice(valid_k_values)
+        chosen_k_pool = kmer_groups[chosen_k]
+        candidate_pool = non_kmer_pool + chosen_k_pool
+        features = draw_random_feature_set(
+            rng=rng,
+            feature_pool=candidate_pool,
+            n_features=n_features,
+            required_pool=chosen_k_pool,  # require at least one kmer from this chosen k
+        )
+        candidates.append({
+            'candidate_id': candidate_id,
+            'model_name': model_name,
+            'model': model,
+            'features': features,
+            'chosen_kmer_k': chosen_k,
+        })
+    return candidates
+
+
 # =========================================================
 # CANDIDATE EVALUATION / SELECTION
 # =========================================================
@@ -668,6 +739,7 @@ def evaluate_and_select_fast_candidate(
             'target_met': target_met,
             'target_met_ge': target_met_ge,
             'model_obj': model,
+            'refinement_changes': cand.get('refinement_changes', {}),
         })
 
     if not rows:
@@ -717,6 +789,8 @@ def evaluate_and_select_full_candidate(
             'eval_mae': metrics_eval['mae'],
             'eval_rmse': metrics_eval['rmse'],
             'model_obj': model,
+            'chosen_kmer_k': cand.get('chosen_kmer_k'),
+            'refinement_changes': cand.get('refinement_changes', {}),
         })
 
     if not rows:
@@ -728,6 +802,202 @@ def evaluate_and_select_full_candidate(
 
     best = min(rows, key=_full_rank_key)
     return best, rows
+
+
+# =========================================================
+# WINNER REFINEMENT
+# =========================================================
+
+def _is_refinable_numeric(value) -> bool:
+    return isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool)
+
+
+def _scaled_numeric_value(base_value, multiplier: float):
+    if isinstance(base_value, (int, np.integer)):
+        return max(1, int(round(float(base_value) * multiplier)))
+    scaled = float(base_value) * multiplier
+    if float(base_value) > 0 and scaled <= 0:
+        return float(base_value)
+    return scaled
+
+
+def get_refinable_param_names(model) -> List[str]:
+    """Return a small set of relevant numeric hyperparameters for local winner refinement."""
+    params = model.get_params()
+    class_name = type(model).__name__
+    preferred_by_model = {
+        'HistGradientBoostingClassifier': ['learning_rate', 'max_iter', 'max_depth', 'min_samples_leaf'],
+        'HistGradientBoostingRegressor': ['learning_rate', 'max_iter', 'max_depth', 'min_samples_leaf'],
+        'RandomForestClassifier': ['n_estimators', 'max_depth', 'min_samples_leaf'],
+        'RandomForestRegressor': ['n_estimators', 'max_depth', 'min_samples_leaf'],
+        'LogisticRegression': ['C'],
+        'Ridge': ['alpha'],
+        'RidgeClassifier': ['alpha'],
+        'SGDClassifier': ['alpha'],
+        'MLPClassifier': ['alpha'],
+        'MLPRegressor': ['alpha'],
+    }
+    preferred = preferred_by_model.get(class_name, [])
+    return [p for p in preferred if p in params and _is_refinable_numeric(params[p])]
+
+
+def build_refinement_candidates(
+    winner: Dict,
+    multipliers: Tuple[float, ...],
+) -> List[Dict]:
+    """Build a local hyperparameter neighborhood around the initial winner."""
+    base_model = winner['model_obj']
+    base_params = base_model.get_params()
+    candidates: List[Dict] = [{
+        'candidate_id': 0,
+        'model_name': winner['model_name'],
+        'model': clone(base_model),
+        'features': winner['features'],
+        'chosen_kmer_k': winner.get('chosen_kmer_k'),
+        'refinement_changes': {},
+    }]
+
+    candidate_id = 1
+    seen = set()
+    for param_name in get_refinable_param_names(base_model):
+        base_value = base_params[param_name]
+        for multiplier in multipliers:
+            scaled_value = _scaled_numeric_value(base_value, multiplier)
+            if scaled_value == base_value:
+                continue
+            key = (param_name, scaled_value)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            tuned_model = clone(base_model).set_params(**{param_name: scaled_value})
+            candidates.append({
+                'candidate_id': candidate_id,
+                'model_name': f"{winner['model_name']}|{param_name}={scaled_value}",
+                'model': tuned_model,
+                'features': winner['features'],
+                'chosen_kmer_k': winner.get('chosen_kmer_k'),
+                'refinement_changes': {param_name: scaled_value},
+            })
+            candidate_id += 1
+
+    return candidates
+
+
+def draw_full_refinement_subset(
+    X: pd.DataFrame,
+    y: pd.Series,
+    subset_size: int,
+    test_fraction: float,
+    seed: int,
+) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, Dict[str, int]]:
+    """Draw homogeneous full-model train/eval subsets from 85–100 identity rows."""
+    mask = (y.values >= HIGH_THRESHOLD) & (y.values <= 100.0)
+    hi_idx = np.where(mask)[0]
+    if len(hi_idx) < 2:
+        raise ValueError("Need at least 2 rows in 85–100 range for full-model refinement.")
+
+    X_hi = X.iloc[hi_idx].reset_index(drop=True)
+    y_hi = y.iloc[hi_idx].reset_index(drop=True)
+
+    n_total = min(subset_size, len(hi_idx))
+    n_eval = max(1, int(round(n_total * test_fraction)))
+    n_eval = min(n_eval, max(1, n_total // 2))
+
+    eval_local_idx = _draw_homogeneous_full_subset(
+        y_hi.values, n_eval, HIGH_THRESHOLD, 100.0, seed=seed,
+    )
+    eval_unique = np.unique(eval_local_idx)
+    remaining_local = np.setdiff1d(np.arange(len(y_hi)), eval_unique)
+    if len(remaining_local) == 0:
+        raise ValueError("No rows left for full-model refinement training after eval draw.")
+
+    X_remaining = X_hi.iloc[remaining_local].reset_index(drop=True)
+    y_remaining = y_hi.iloc[remaining_local].reset_index(drop=True)
+
+    n_train = min(n_total - len(eval_unique), len(remaining_local))
+    if n_train < 1:
+        n_train = min(len(remaining_local), 1)
+
+    train_local_idx = _draw_homogeneous_full_subset(
+        y_remaining.values, n_train, HIGH_THRESHOLD, 100.0, seed=seed + 1,
+    )
+
+    X_train = X_remaining.iloc[train_local_idx].reset_index(drop=True)
+    y_train = y_remaining.iloc[train_local_idx].reset_index(drop=True)
+    X_eval = X_hi.iloc[eval_local_idx].reset_index(drop=True)
+    y_eval = y_hi.iloc[eval_local_idx].reset_index(drop=True)
+
+    return X_train, y_train, X_eval, y_eval, {
+        'subset_total': int(n_total),
+        'train_total': int(len(y_train)),
+        'eval_total': int(len(y_eval)),
+        'high_identity_pool': int(len(hi_idx)),
+    }
+
+
+def refine_fast_winner(
+    X: pd.DataFrame,
+    y: pd.Series,
+    winner: Dict,
+    subset_size: int,
+    test_fraction: float,
+    seed: int,
+) -> Tuple[Dict, Dict]:
+    """Refine fast winner on a balanced subset using local hyperparameter multipliers."""
+    X_sub, y_sub = draw_balanced_fast_candidate_subset(
+        X, y, subset_size=subset_size, threshold=HIGH_THRESHOLD, seed=seed + 301,
+    )
+    y_sub_bin = (y_sub.values >= HIGH_THRESHOLD).astype(int)
+    train_idx, eval_idx = _balanced_binary_train_test_split_indices(y_sub_bin, test_fraction, seed + 302)
+    X_train = X_sub.iloc[train_idx].reset_index(drop=True)
+    y_train = y_sub.iloc[train_idx].reset_index(drop=True)
+    X_eval = X_sub.iloc[eval_idx].reset_index(drop=True)
+    y_eval = y_sub.iloc[eval_idx].reset_index(drop=True)
+
+    candidates = build_refinement_candidates(winner, REFINEMENT_MULTIPLIERS)
+    refined_winner, _ = evaluate_and_select_fast_candidate(
+        X_train, y_train, X_eval, y_eval, candidates, target_recall=TARGET_RECALL,
+    )
+    summary = {
+        'subset_size': int(len(X_sub)),
+        'train_size': int(len(X_train)),
+        'eval_size': int(len(X_eval)),
+        'n_candidates': int(len(candidates)),
+        'multipliers': list(REFINEMENT_MULTIPLIERS),
+        'initial_model_name': winner['model_name'],
+        'selected_model_name': refined_winner['model_name'],
+        'selected_changes': refined_winner.get('refinement_changes', {}),
+    }
+    return refined_winner, summary
+
+
+def refine_full_winner(
+    X: pd.DataFrame,
+    y: pd.Series,
+    winner: Dict,
+    subset_size: int,
+    test_fraction: float,
+    seed: int,
+) -> Tuple[Dict, Dict]:
+    """Refine full winner on a homogeneous 85–100 subset using local multipliers."""
+    X_train, y_train, X_eval, y_eval, draw_summary = draw_full_refinement_subset(
+        X, y, subset_size=subset_size, test_fraction=test_fraction, seed=seed + 401,
+    )
+
+    candidates = build_refinement_candidates(winner, REFINEMENT_MULTIPLIERS)
+    refined_winner, _ = evaluate_and_select_full_candidate(
+        X_train, y_train, X_eval, y_eval, candidates,
+    )
+    summary = {
+        **draw_summary,
+        'n_candidates': int(len(candidates)),
+        'multipliers': list(REFINEMENT_MULTIPLIERS),
+        'initial_model_name': winner['model_name'],
+        'selected_model_name': refined_winner['model_name'],
+        'selected_changes': refined_winner.get('refinement_changes', {}),
+    }
+    return refined_winner, summary
 
 
 # =========================================================
@@ -780,7 +1050,7 @@ def retrain_fast_model(
 ) -> Dict:
     """Retrain winning fast-model configuration on full balanced binary data.
 
-    Training is capped at FAST_RETRAIN_MAX_TRAIN (500,000) rows while preserving
+    Training is capped at FAST_RETRAIN_MAX_TRAIN (1,000,000) rows while preserving
     the <85 vs >=85 class balance.
     """
     X_train, y_train, X_test, y_test, balance_summary = draw_fast_final_balanced_split(
@@ -799,7 +1069,10 @@ def retrain_fast_model(
         seed=seed,
     )
 
-    print(f"  Fast model retrain — train: {len(y_train):,} | test: {len(y_test):,}")
+    print(
+        f"  Fast model retrain — train: {len(y_train):,} | test: {len(y_test):,} "
+        f"(balanced pool: {balance_summary['balanced_total']:,})"
+    )
 
     y_train_bin = (y_train.values >= HIGH_THRESHOLD).astype(int)
     y_test_bin = (y_test.values >= HIGH_THRESHOLD).astype(int)
@@ -823,6 +1096,7 @@ def retrain_fast_model(
         'model': model,
         'model_name': winner['model_name'],
         'features': features,
+        'refinement_changes': winner.get('refinement_changes', {}),
         'threshold': float(threshold),
         'target_recall': TARGET_RECALL,
         'train_metrics': compute_binary_metrics(y_train_bin, train_pred),
@@ -839,7 +1113,7 @@ def retrain_full_model(
 ) -> Dict:
     """Retrain winning full-model configuration on a capped, homogeneously-balanced 85–100 split.
 
-    Training is capped at FULL_RETRAIN_MAX_TRAIN (500,000) rows; validation uses a
+    Training is capped at FULL_RETRAIN_MAX_TRAIN (1,000,000) rows; validation uses a
     separate FULL_RETRAIN_VAL_SIZE (10,000) row set.  Both sets are drawn with
     uniform coverage across the 85–100 identity range.
     """
@@ -891,6 +1165,8 @@ def retrain_full_model(
         'model': model,
         'model_name': winner['model_name'],
         'features': features,
+        'chosen_kmer_k': winner.get('chosen_kmer_k'),
+        'refinement_changes': winner.get('refinement_changes', {}),
         'selection_metric': 'heldout_rmse_85_100',
         'train_metrics': compute_regression_metrics(y_train.values, train_pred),
         'test_metrics': compute_regression_metrics(y_val.values, val_pred),
@@ -938,6 +1214,7 @@ def save_final_artifacts(
     fast_metadata = {
         'selected_model_name': fast_result['model_name'],
         'selected_features': fast_result['features'],
+        'selected_hyperparameter_changes': fast_result.get('refinement_changes', {}),
         'threshold': fast_result['threshold'],
         'target_recall': fast_result['target_recall'],
         'train_metrics': fast_result['train_metrics'],
@@ -948,6 +1225,8 @@ def save_final_artifacts(
     full_metadata = {
         'selected_model_name': full_result['model_name'],
         'selected_features': full_result['features'],
+        'selected_kmer_k': full_result.get('chosen_kmer_k'),
+        'selected_hyperparameter_changes': full_result.get('refinement_changes', {}),
         'selection_metric': full_result['selection_metric'],
         'train_metrics': full_result['train_metrics'],
         'test_metrics': full_result['test_metrics'],
@@ -974,7 +1253,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Train NanoPred using a simplified two-model workflow: "
-            "fast binary candidate search + final retraining, and full high-identity regression candidate search + final retraining."
+            "fast/full candidate search, winner-local refinement on 100k subsets, "
+            "and capped final retraining."
         )
     )
     parser.add_argument('--input', '-i', default='all_pairs_data.csv', help='Path to training CSV.')
@@ -1104,13 +1384,12 @@ def main() -> None:
     if not full_kmer_pool:
         raise ValueError("Full model requires at least one kmer feature, but none were found.")
 
-    full_candidates = generate_random_candidates(
+    full_candidates = generate_random_full_candidates_single_k(
         models=base_regressors,
         feature_pool=full_feature_pool,
         n_features=FULL_FEATURE_COUNT,
         n_candidates=args.n_candidates,
         seed=args.seed + 101,
-        required_feature_pool=full_kmer_pool,
     )
 
     full_winner, full_candidate_rows = evaluate_and_select_full_candidate(
@@ -1124,10 +1403,45 @@ def main() -> None:
     print(
         f"Full winner: {full_winner['model_name']} "
         f"| eval_rmse={full_winner['eval_rmse']:.4f} "
-        f"| eval_r2={full_winner['eval_r2']:.4f}"
+        f"| eval_r2={full_winner['eval_r2']:.4f} "
+        f"| chosen_k={full_winner.get('chosen_kmer_k')}"
     )
 
-    # 4) Final retraining
+    # 4) Winner refinement
+    print("\n" + "=" * 72)
+    print("WINNER REFINEMENT")
+    print("=" * 72)
+
+    refined_fast_winner, fast_refinement_summary = refine_fast_winner(
+        X,
+        y,
+        winner=fast_winner,
+        subset_size=REFINEMENT_SUBSET_SIZE,
+        test_fraction=TEST_FRACTION,
+        seed=args.seed,
+    )
+    print(
+        f"  Fast refinement — train: {fast_refinement_summary['train_size']:,} "
+        f"| test: {fast_refinement_summary['eval_size']:,} "
+        f"| winner: {refined_fast_winner['model_name']}"
+    )
+
+    refined_full_winner, full_refinement_summary = refine_full_winner(
+        X,
+        y,
+        winner=full_winner,
+        subset_size=REFINEMENT_SUBSET_SIZE,
+        test_fraction=TEST_FRACTION,
+        seed=args.seed,
+    )
+    print(
+        f"  Full refinement — train: {full_refinement_summary['train_total']:,} "
+        f"| test: {full_refinement_summary['eval_total']:,} "
+        f"| winner: {refined_full_winner['model_name']} "
+        f"| chosen_k={refined_full_winner.get('chosen_kmer_k')}"
+    )
+
+    # 5) Final retraining
     print("\n" + "=" * 72)
     print("FINAL RETRAINING")
     print("=" * 72)
@@ -1135,14 +1449,14 @@ def main() -> None:
     fast_result = retrain_fast_model(
         X,
         y,
-        winner=fast_winner,
+        winner=refined_fast_winner,
         test_fraction=args.test_fraction,
         seed=args.seed,
     )
     full_result = retrain_full_model(
         X,
         y,
-        winner=full_winner,
+        winner=refined_full_winner,
         seed=args.seed,
     )
 
@@ -1153,23 +1467,29 @@ def main() -> None:
         'n_candidates': int(len(fast_candidate_rows)),
         'selection_rule': f'highest precision with recall > {TARGET_RECALL}; fallback highest recall then precision',
         'winner_eval_metrics': {
-            'recall': fast_winner['recall'],
-            'precision': fast_winner['precision'],
-            'threshold': fast_winner['threshold'],
-            'target_met': fast_winner['target_met'],
+            'recall': refined_fast_winner['recall'],
+            'precision': refined_fast_winner['precision'],
+            'threshold': refined_fast_winner['threshold'],
+            'target_met': refined_fast_winner['target_met'],
         },
+        'winner_refinement': fast_refinement_summary,
     }
     full_search_summary = {
         'subset_size': int(len(X_full_sub)),
         'train_size': int(len(X_full_train)),
         'eval_size': int(len(X_full_eval)),
         'n_candidates': int(len(full_candidate_rows)),
-        'selection_rule': 'lowest held-out RMSE on 85–100 candidate subset (tie: higher R², then lower MAE)',
+        'selection_rule': (
+            'lowest held-out RMSE on 85–100 candidate subset with exactly one chosen kmer k '
+            '(tie: higher R², then lower MAE)'
+        ),
         'winner_eval_metrics': {
-            'rmse': full_winner['eval_rmse'],
-            'r2': full_winner['eval_r2'],
-            'mae': full_winner['eval_mae'],
+            'rmse': refined_full_winner['eval_rmse'],
+            'r2': refined_full_winner['eval_r2'],
+            'mae': refined_full_winner['eval_mae'],
+            'chosen_kmer_k': refined_full_winner.get('chosen_kmer_k'),
         },
+        'winner_refinement': full_refinement_summary,
     }
 
     save_final_artifacts(

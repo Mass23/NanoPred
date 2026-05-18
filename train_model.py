@@ -53,8 +53,8 @@ import numpy as np
 import pandas as pd
 from sklearn.base import clone
 from sklearn.ensemble import (
-    GradientBoostingClassifier,
-    GradientBoostingRegressor,
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
     RandomForestClassifier,
     RandomForestRegressor,
 )
@@ -73,12 +73,12 @@ FAST_CANDIDATE_SUBSET_SIZE = 10_000
 FULL_CANDIDATE_SUBSET_SIZE = 10_000
 N_RANDOM_CANDIDATES = 500
 
-FAST_FEATURE_COUNT = 5
-FULL_FEATURE_COUNT = 10
+FAST_FEATURE_COUNT = 6
+FULL_FEATURE_COUNT = 18
 
 TEST_FRACTION = 0.10
 
-FULL_RETRAIN_MAX_TRAIN = 200_000   # cap on training rows for the full model final retrain
+FULL_RETRAIN_MAX_TRAIN = 500_000   # cap on training rows for the full model final retrain
 FULL_RETRAIN_VAL_SIZE  = 10_000    # fixed validation set size for the full model final retrain
 
 GC_PREFIX = "gc"
@@ -181,12 +181,15 @@ def get_base_regressors(seed: int = 23) -> List[Tuple[str, object]]:
         ("RF_md12", RandomForestRegressor(n_estimators=300, max_depth=12, random_state=seed, n_jobs=12)),
         ("RF_500", RandomForestRegressor(n_estimators=500, max_depth=6, random_state=seed, n_jobs=12)),
         ("RF_1000", RandomForestRegressor(n_estimators=1000, max_depth=4, random_state=seed, n_jobs=12)),
-        ("GBR_d3_lr01", GradientBoostingRegressor(n_estimators=200, max_depth=3, learning_rate=0.10, random_state=seed)),
-        ("GBR_d5_lr01", GradientBoostingRegressor(n_estimators=200, max_depth=5, learning_rate=0.10, random_state=seed)),
-        ("GBR_d3_lr005", GradientBoostingRegressor(n_estimators=300, max_depth=3, learning_rate=0.05, random_state=seed)),
-        ("GBR_d5_lr005", GradientBoostingRegressor(n_estimators=300, max_depth=5, learning_rate=0.05, random_state=seed)),
-        ("GBR_d3_lr001", GradientBoostingRegressor(n_estimators=200, max_depth=7, learning_rate=0.01, random_state=seed)),
-        ("GBR_d5_lr001", GradientBoostingRegressor(n_estimators=300, max_depth=7, learning_rate=0.01, random_state=seed)),
+        ("HGBR_d2_lr01", HistGradientBoostingRegressor(max_iter=150, max_depth=2, learning_rate=0.10, random_state=seed)),
+        ("HGBR_d7_lr01", HistGradientBoostingRegressor(max_iter=200, max_depth=7, learning_rate=0.10, random_state=seed)),
+        ("HGBR_d3_lr002", HistGradientBoostingRegressor(max_iter=500, max_depth=3, learning_rate=0.02, random_state=seed)),
+        ("HGBR_d3_lr02", HistGradientBoostingRegressor(max_iter=120, max_depth=3, learning_rate=0.20, random_state=seed)),
+        ("HGBR_d7_lr003", HistGradientBoostingRegressor(max_iter=600, max_depth=7, learning_rate=0.03, random_state=seed)),
+        ("HGBR_d4_lr007", HistGradientBoostingRegressor(max_iter=250, max_depth=4, learning_rate=0.07, random_state=seed)),
+        ("HGBR_d3_lr001", HistGradientBoostingRegressor(max_iter=1000, max_depth=3, learning_rate=0.01, random_state=seed)),
+        ("HGBR_d6_lr015", HistGradientBoostingRegressor(max_iter=150, max_depth=6, learning_rate=0.15, random_state=seed)),
+        ("HGBR_reg", HistGradientBoostingRegressor(max_iter=400, max_depth=5, learning_rate=0.03, min_samples_leaf=30, l2_regularization=1.0, early_stopping=True, random_state=seed)),      
         ("MLP_32_16", MLPRegressor(hidden_layer_sizes=(32, 16), max_iter=400, random_state=seed)),
         ("MLP_32", MLPRegressor(hidden_layer_sizes=(32,), max_iter=400, random_state=seed)),
         ("MLP_16_32", MLPRegressor(hidden_layer_sizes=(16, 32), max_iter=400, random_state=seed)),
@@ -213,10 +216,15 @@ def get_base_classifiers(seed: int = 23) -> List[Tuple[str, object]]:
         ("RFC_md6", RandomForestClassifier(n_estimators=150, max_depth=6, random_state=seed, n_jobs=12)),
         ("RFC_md8", RandomForestClassifier(n_estimators=200, max_depth=8, random_state=seed, n_jobs=12)),
         ("RFC_md10", RandomForestClassifier(n_estimators=250, max_depth=10, random_state=seed, n_jobs=12)),
-        ("GBC_d3_lr01", GradientBoostingClassifier(n_estimators=200, max_depth=3, learning_rate=0.10, random_state=seed)),
-        ("GBC_d5_lr01", GradientBoostingClassifier(n_estimators=200, max_depth=5, learning_rate=0.10, random_state=seed)),
-        ("GBC_d3_lr005", GradientBoostingClassifier(n_estimators=300, max_depth=3, learning_rate=0.05, random_state=seed)),
-        ("GBC_d5_lr005", GradientBoostingClassifier(n_estimators=300, max_depth=5, learning_rate=0.05, random_state=seed)),
+        ("HGBC_d2_lr01", HistGradientBoostingClassifier(max_iter=150, max_depth=2, learning_rate=0.10, random_state=seed)),
+        ("HGBC_d7_lr01", HistGradientBoostingClassifier(max_iter=200, max_depth=7, learning_rate=0.10, random_state=seed)),
+        ("HGBC_d3_lr002", HistGradientBoostingClassifier(max_iter=500, max_depth=3, learning_rate=0.02, random_state=seed)),
+        ("HGBC_d3_lr02", HistGradientBoostingClassifier(max_iter=120, max_depth=3, learning_rate=0.20, random_state=seed)),
+        ("HGBC_d7_lr003", HistGradientBoostingClassifier(max_iter=600, max_depth=7, learning_rate=0.03, random_state=seed)),
+        ("HGBC_d4_lr007", HistGradientBoostingClassifier(max_iter=250, max_depth=4, learning_rate=0.07, random_state=seed)),
+        ("HGBC_d3_lr001", HistGradientBoostingClassifier(max_iter=1000, max_depth=3, learning_rate=0.01, random_state=seed)),
+        ("HGBC_d6_lr015", HistGradientBoostingClassifier(max_iter=150, max_depth=6, learning_rate=0.15, random_state=seed)),
+        ("HGBC_reg", HistGradientBoostingClassifier(max_iter=400, max_depth=5, learning_rate=0.03, min_samples_leaf=30, l2_regularization=1.0, early_stopping=True, random_state=seed)),
         ("MLPClf_32_16", MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=400, random_state=seed)),
         ("MLPClf_32", MLPClassifier(hidden_layer_sizes=(32,), max_iter=400, random_state=seed)),
         ("MLPClf_16_32", MLPClassifier(hidden_layer_sizes=(16, 32), max_iter=400, random_state=seed)),
@@ -778,7 +786,7 @@ def retrain_full_model(
 ) -> Dict:
     """Retrain winning full-model configuration on a capped, homogeneously-balanced 85–100 split.
 
-    Training is capped at FULL_RETRAIN_MAX_TRAIN (200,000) rows; validation uses a
+    Training is capped at FULL_RETRAIN_MAX_TRAIN (100,000) rows; validation uses a
     separate FULL_RETRAIN_VAL_SIZE (10,000) row set.  Both sets are drawn with
     uniform coverage across the 85–100 identity range.
     """

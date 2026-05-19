@@ -653,14 +653,18 @@ def generate_random_full_candidates_single_k(
     """Generate full-model candidates constrained to exactly one chosen k value."""
     rng = rnd.Random(seed)
 
-    kmer_like_features = [f for f in feature_pool if get_feature_prefix(base_name(f)) == KMER_PREFIX]
-    non_kmer_pool = [f for f in feature_pool if get_feature_prefix(base_name(f)) != KMER_PREFIX]
+    kmer_like_features: List[str] = []
+    non_kmer_pool: List[str] = []
     kmer_groups: Dict[int, List[str]] = {}
     for feature in feature_pool:
         base = base_name(feature)
-        k_val = extract_kmer_k(base)
-        if k_val is not None:
-            kmer_groups.setdefault(k_val, []).append(feature)
+        if get_feature_prefix(base) == KMER_PREFIX:
+            kmer_like_features.append(feature)
+            k_val = extract_kmer_k(base)
+            if k_val is not None:
+                kmer_groups.setdefault(k_val, []).append(feature)
+        else:
+            non_kmer_pool.append(feature)
 
     valid_k_values = [
         k_val

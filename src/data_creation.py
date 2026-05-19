@@ -456,6 +456,9 @@ def compute_pair_features(m1: dict, m2: dict) -> dict:
 # Dataset generation
 # ---------------------------------------------------------------------------
 
+MAX_BALANCE_ATTEMPTS_MULTIPLIER = 50
+
+
 def generate_dataset(
     fasta_paths: Union[str, List[str]],
     num_pairs: int,
@@ -559,7 +562,7 @@ def generate_dataset(
     accepted_low = 0
     accepted_high = 0
     attempts = 0
-    max_attempts = max(shard_pairs * 200, shard_pairs + 1)
+    max_attempts = max(shard_pairs * MAX_BALANCE_ATTEMPTS_MULTIPLIER, shard_pairs + 1)
 
     with tqdm(total=shard_pairs, desc="Generating pairs", unit="pair") as pbar:
         while rows_written < shard_pairs:
@@ -593,10 +596,9 @@ def generate_dataset(
                     in_low_bucket = pct_id <= 85.0
 
                     # Skip expensive downstream metrics/features when this bucket is full.
-                    if in_low_bucket:
-                        if accepted_low >= low_target:
-                            continue
-                    elif accepted_high >= high_target:
+                    if (in_low_bucket and accepted_low >= low_target) or (
+                        not in_low_bucket and accepted_high >= high_target
+                    ):
                         continue
 
                     # Per-sequence metrics
@@ -613,9 +615,6 @@ def generate_dataset(
                         accepted_low += 1
                     else:
                         accepted_high += 1
-
-                    if rows_written + len(chunk_rows) >= shard_pairs:
-                        break
 
                 except (ValueError, TypeError, ZeroDivisionError, StopIteration) as exc:
                     import warnings

@@ -18,7 +18,7 @@ Workflow overview:
      - Use all datapoints to build a balanced (<85 vs >=85) dataset
        (oversampling the minority class if needed).
      - Hold out a balanced 10% test split.
-     - Cap the training set to at most 1,000,000 rows while preserving class balance.
+     - Cap the training set to at most 200,000 rows while preserving class balance.
      - Train the winning configuration on the capped balanced train split.
 
   3) FULL MODEL candidate search (regression, 85 <= y <= 100):
@@ -86,7 +86,7 @@ FULL_FEATURE_COUNT = 18
 
 TEST_FRACTION = 0.10
 
-FAST_RETRAIN_MAX_TRAIN = 1_000_000   # cap on training rows for the fast model final retrain
+FAST_RETRAIN_MAX_TRAIN = 200_000     # cap on training rows for the fast model final retrain
 FULL_RETRAIN_MAX_TRAIN = 1_000_000   # cap on training rows for the full model final retrain
 FULL_RETRAIN_VAL_SIZE  = 10_000    # fixed validation set size for the full model final retrain
 REFINEMENT_SUBSET_SIZE = 100_000   # subset size used for winner-local hyperparameter refinement
@@ -1060,7 +1060,7 @@ def retrain_fast_model(
 ) -> Dict:
     """Retrain winning fast-model configuration on full balanced binary data.
 
-    Training is capped at FAST_RETRAIN_MAX_TRAIN (1,000,000) rows while preserving
+    Training is capped at FAST_RETRAIN_MAX_TRAIN (200,000) rows while preserving
     the <85 vs >=85 class balance.
     """
     X_train, y_train, X_test, y_test, balance_summary = draw_fast_final_balanced_split(

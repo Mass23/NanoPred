@@ -20,7 +20,7 @@ import os
 import subprocess
 import sys
 
-from src.data_creation import generate_dataset, merge_shards
+from src.data_creation import BALANCE_THRESHOLD, generate_dataset, merge_shards
 
 
 def _expected_rows(num_pairs: int, num_shards: int, shard_id: int) -> int:
@@ -61,7 +61,7 @@ def _validate_shard_row_counts(output_csv: str, num_pairs: int, num_shards: int)
             for row in reader:
                 actual += 1
                 pct_id = float(row["real_percent_identity"])
-                if pct_id <= 85.0:
+                if pct_id <= BALANCE_THRESHOLD:
                     actual_low += 1
                 else:
                     actual_high += 1
@@ -168,7 +168,8 @@ def main():
     args = parser.parse_args()
     if args.num_pairs % 2 != 0:
         parser.error(
-            "--num-pairs must be even to enforce a 50/50 split around real_percent_identity=85"
+            "--num-pairs must be even to enforce a 50/50 split around "
+            f"real_percent_identity={BALANCE_THRESHOLD:g}"
         )
 
     # ------------------------------------------------------------------

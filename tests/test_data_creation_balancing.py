@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from data_creation import _validate_shard_row_counts
-from src.data_creation import generate_dataset
+from src.data_creation import BALANCE_THRESHOLD, generate_dataset
 
 
 class TestDataCreationBalancing(unittest.TestCase):
@@ -50,8 +50,8 @@ class TestDataCreationBalancing(unittest.TestCase):
                 rows = list(csv.DictReader(f))
 
         self.assertEqual(len(rows), 4)
-        low = sum(float(r["real_percent_identity"]) <= 85.0 for r in rows)
-        high = sum(float(r["real_percent_identity"]) > 85.0 for r in rows)
+        low = sum(float(r["real_percent_identity"]) <= BALANCE_THRESHOLD for r in rows)
+        high = sum(float(r["real_percent_identity"]) > BALANCE_THRESHOLD for r in rows)
         self.assertEqual(low, 2)
         self.assertEqual(high, 2)
         self.assertEqual(mock_compute_metrics.call_count, 8)

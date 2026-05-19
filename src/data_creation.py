@@ -456,6 +456,7 @@ def compute_pair_features(m1: dict, m2: dict) -> dict:
 # Dataset generation
 # ---------------------------------------------------------------------------
 
+BALANCE_THRESHOLD = 85.0
 MAX_BALANCE_ATTEMPTS_MULTIPLIER = 50
 
 
@@ -501,7 +502,8 @@ def generate_dataset(
         raise ValueError(f"shard_id must be in [0, num_shards-1], got {shard_id}/{num_shards}")
     if num_pairs % 2 != 0:
         raise ValueError(
-            f"num_pairs must be even to enforce a 50/50 split around real_percent_identity=85, got {num_pairs}"
+            f"num_pairs must be even to enforce a 50/50 split around "
+            f"real_percent_identity={BALANCE_THRESHOLD:g}, got {num_pairs}"
         )
 
     # Per-shard RNG seeding — use a hash to ensure well-separated seeds even
@@ -593,7 +595,7 @@ def generate_dataset(
 
                     # Alignment-based percent identity (target variable)
                     pct_id = align_sequences(seq1, seq2)
-                    in_low_bucket = pct_id <= 85.0
+                    in_low_bucket = pct_id <= BALANCE_THRESHOLD
 
                     # Skip expensive downstream metrics/features when this bucket is full.
                     if (in_low_bucket and accepted_low >= low_target) or (

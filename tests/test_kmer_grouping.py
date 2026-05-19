@@ -80,11 +80,20 @@ class TestKmerGrouping(unittest.TestCase):
         self.assertIsNone(train_model.extract_kmer_k("kmer_5x_hashjaccard_64"))
         self.assertIsNone(train_model.extract_kmer_k("quality_hash_64"))
 
-    def test_full_candidate_generation_constrains_to_single_k(self):
+    def test_extract_kmer_hash_size_uses_last_numeric_token(self):
+        self.assertEqual(train_model.extract_kmer_hash_size("kmer_5_hashjaccard_64"), 64)
+        self.assertEqual(train_model.extract_kmer_hash_size("kmer_foo_7_256__log"), 256)
+        self.assertIsNone(train_model.extract_kmer_hash_size("kmer_bucket_5"))
+        self.assertIsNone(train_model.extract_kmer_hash_size("kmer_5x_hashjaccard_64"))
+        self.assertIsNone(train_model.extract_kmer_hash_size("quality_hash_64"))
+
+    def test_full_candidate_generation_constrains_to_single_k_hash_and_required_core(self):
         feature_pool = [
             "gc_mean",
             "length_min",
             "quality_hash_64",
+            "quality_hash_128",
+            "gc_std",
             "kmer_3_hashjaccard_64",
             "kmer_3_hashjaccard_128",
             "kmer_5_hashjaccard_64",
@@ -97,11 +106,15 @@ class TestKmerGrouping(unittest.TestCase):
             n_features=5,
             n_candidates=25,
             seed=23,
+            required_features=["gc_mean", "length_min"],
         )
 
         self.assertTrue(candidates)
         for candidate in candidates:
             chosen_k = candidate["chosen_kmer_k"]
+            chosen_hash = candidate["chosen_kmer_hash_size"]
+            self.assertIn("gc_mean", candidate["features"])
+            self.assertIn("length_min", candidate["features"])
             kmer_features = [
                 feat for feat in candidate["features"]
                 if train_model.get_feature_prefix(train_model.base_name(feat)) == train_model.KMER_PREFIX
@@ -109,6 +122,16 @@ class TestKmerGrouping(unittest.TestCase):
             self.assertTrue(kmer_features)
             self.assertTrue(
                 all(train_model.extract_kmer_k(train_model.base_name(feat)) == chosen_k for feat in kmer_features)
+            )
+            self.assertTrue(
+                all(
+                    train_model.extract_kmer_hash_size(train_model.base_name(feat)) == chosen_hash
+                    for feat in kmer_features
+                )
+            )
+            self.assertEqual(
+                candidate["chosen_kmer_config"],
+                {"k_values": [chosen_k], "hash_sizes": [chosen_hash]},
             )
 
     def test_full_candidate_generation_reports_debug_when_no_valid_group(self):
@@ -119,7 +142,7 @@ class TestKmerGrouping(unittest.TestCase):
             "kmer_hashjaccard",
             "kmer_noise_feature",
         ]
-        with self.assertRaisesRegex(ValueError, "sample: .*Parsed k groups:"):
+        with self.assertRaisesRegex(ValueError, "sample: .*Parsed k/hash groups:"):
             train_model.generate_random_full_candidates_single_k(
                 models=[("dummy", object())],
                 feature_pool=feature_pool,

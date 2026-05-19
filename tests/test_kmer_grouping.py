@@ -131,7 +131,7 @@ class TestKmerGrouping(unittest.TestCase):
             )
             self.assertEqual(
                 candidate["chosen_kmer_config"],
-                {"k_values": [chosen_k], "hash_sizes": [chosen_hash]},
+                {"k_value": chosen_k, "hash_size": chosen_hash},
             )
 
     def test_full_candidate_generation_reports_debug_when_no_valid_group(self):

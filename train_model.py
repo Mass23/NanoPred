@@ -7,7 +7,7 @@ Workflow overview:
      - Generate 2000 random candidates.
      - Each candidate picks:
          * one classifier from get_base_classifiers()
-         * exactly 5 random GC/length/quality features (no kmer features)
+         * exactly 6 random GC/length/quality features (no kmer features)
      - Select winner by highest precision among candidates with recall > 0.99
        on held-out selection data.
        Fallback if none satisfy recall > 0.99: highest recall, then precision.
@@ -26,7 +26,7 @@ Workflow overview:
      - Generate 2000 random candidates.
      - Each candidate picks:
          * one regressor from get_base_regressors()
-         * exactly 10 random features
+         * exactly 18 total features
          * feature set must include at least one kmer feature
          * every candidate must include all selected fast-model features
          * kmer features must all use exactly one chosen (k, hash-size) configuration
@@ -184,7 +184,7 @@ def extract_kmer_k(base_feature: str) -> Optional[int]:
 
 
 def extract_kmer_hash_size(base_feature: str) -> Optional[int]:
-    """Extract hash size from a kmer feature named with a numeric suffix like *_5_64."""
+    """Extract hash size from names like kmer_5_hashjaccard_64 (returns 64)."""
     base = base_name(base_feature)
     if get_feature_prefix(base) != KMER_PREFIX:
         return None
@@ -664,7 +664,13 @@ def generate_random_full_candidates_single_k(
 ) -> List[Dict]:
     """Generate full-model candidates constrained to one chosen (k, hash-size) kmer config."""
     rng = rnd.Random(seed)
-    required_core = list(dict.fromkeys(required_features or []))
+    seen_required = set()
+    required_core: List[str] = []
+    for feature in (required_features or []):
+        if feature in seen_required:
+            continue
+        seen_required.add(feature)
+        required_core.append(feature)
 
     if len(required_core) > n_features:
         raise ValueError(
@@ -688,7 +694,7 @@ def generate_random_full_candidates_single_k(
         else:
             non_kmer_pool.append(feature)
 
-    valid_k_configs: List[Tuple[int, int]] = []
+    valid_k_configs: List[Tuple[int, int]] = []  # entries are (k_value, hash_size)
     for k_config, k_features in kmer_groups.items():
         candidate_pool = non_kmer_pool + k_features
         if len(candidate_pool) < n_features:
@@ -707,7 +713,7 @@ def generate_random_full_candidates_single_k(
             for (k_val, hash_size), v in sorted(kmer_groups.items())
         }
         raise ValueError(
-            "Full model requires kmer features grouped by (k, hash), but no valid k/hash groups were found. "
+            "Full model requires kmer features grouped by (k, hash), but no valid (k, hash-size) groups were found. "
             f"Found {len(kmer_like_features)} kmer-like columns (sample: {kmer_sample}). "
             f"Parsed k/hash groups: {discovered_groups}."
         )
@@ -717,20 +723,30 @@ def generate_random_full_candidates_single_k(
         model_name, model = rng.choice(models)
         chosen_k, chosen_hash_size = rng.choice(valid_k_configs)
         chosen_k_pool = kmer_groups[(chosen_k, chosen_hash_size)]
+        chosen_k_pool_set = set(chosen_k_pool)
         candidate_pool = non_kmer_pool + chosen_k_pool
         selected = list(required_core)
         remaining_pool = [f for f in candidate_pool if f not in selected]
+        remaining_pool_set = set(remaining_pool)
 
-        has_kmer = any(f in chosen_k_pool for f in selected)
+        has_kmer = any(f in chosen_k_pool_set for f in selected)
         if not has_kmer:
-            kmer_options = [f for f in chosen_k_pool if f in remaining_pool]
+            kmer_options = [f for f in chosen_k_pool if f in remaining_pool_set]
             if not kmer_options:
-                continue
+                raise ValueError(
+                    f"No kmer feature available for required (k, hash-size)=({chosen_k}, {chosen_hash_size}) "
+                    "after applying required full-model features."
+                )
             must_kmer = rng.choice(kmer_options)
             selected.append(must_kmer)
             remaining_pool.remove(must_kmer)
 
         remaining_n = n_features - len(selected)
+        if len(remaining_pool) < remaining_n:
+            raise ValueError(
+                f"Insufficient remaining features to complete full-model candidate: "
+                f"need {remaining_n}, have {len(remaining_pool)}."
+            )
         if remaining_n > 0:
             selected.extend(rng.sample(remaining_pool, remaining_n))
 
@@ -741,7 +757,8 @@ def generate_random_full_candidates_single_k(
             'features': selected,
             'chosen_kmer_k': chosen_k,
             'chosen_kmer_hash_size': chosen_hash_size,
-            'chosen_kmer_config': {'k_values': [chosen_k], 'hash_sizes': [chosen_hash_size]},
+            # Keep combined config for explicit metadata while preserving legacy scalar keys.
+            'chosen_kmer_config': {'k_value': chosen_k, 'hash_size': chosen_hash_size},
         })
     return candidates
 

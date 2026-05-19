@@ -54,6 +54,7 @@ import argparse
 import json
 import os
 import random as rnd
+import re
 from typing import Dict, List, Optional, Tuple
 
 import joblib
@@ -171,16 +172,15 @@ def get_columns_by_prefix(X: pd.DataFrame, allowed_prefixes: List[str]) -> List[
 
 def extract_kmer_k(base_feature: str) -> Optional[int]:
     """Extract k from a kmer feature named with a numeric suffix pattern like *_5_64."""
-    if get_feature_prefix(base_feature) != KMER_PREFIX:
+    base = base_name(base_feature)
+    if get_feature_prefix(base) != KMER_PREFIX:
         return None
-    tokens = base_feature.split("_")
-    if len(tokens) < 3:
+    numeric_tokens = [int(tok) for tok in re.findall(r"\d+", base)]
+    if len(numeric_tokens) < 2:
         return None
-    try:
-        # Naming convention: ..._<k>_<hash_size>
-        return int(tokens[-2])
-    except ValueError:
-        return None
+    # Naming convention is permissive; for names like ..._5_64, k is the
+    # second-to-last numeric token and hash size is the last token.
+    return numeric_tokens[-2]
 
 
 # =========================================================
@@ -653,6 +653,7 @@ def generate_random_full_candidates_single_k(
     """Generate full-model candidates constrained to exactly one chosen k value."""
     rng = rnd.Random(seed)
 
+    kmer_like_features = [f for f in feature_pool if get_feature_prefix(base_name(f)) == KMER_PREFIX]
     non_kmer_pool = [f for f in feature_pool if get_feature_prefix(base_name(f)) != KMER_PREFIX]
     kmer_groups: Dict[int, List[str]] = {}
     for feature in feature_pool:
@@ -667,7 +668,13 @@ def generate_random_full_candidates_single_k(
         if len(non_kmer_pool) + len(k_features) >= n_features and len(k_features) > 0
     ]
     if not valid_k_values:
-        raise ValueError("Full model requires kmer features grouped by k, but no valid k groups were found.")
+        kmer_sample = ", ".join(kmer_like_features[:5]) if kmer_like_features else "<none>"
+        discovered_groups = {k: len(v) for k, v in sorted(kmer_groups.items())}
+        raise ValueError(
+            "Full model requires kmer features grouped by k, but no valid k groups were found. "
+            f"Found {len(kmer_like_features)} kmer-like columns (sample: {kmer_sample}). "
+            f"Parsed k groups: {discovered_groups}."
+        )
 
     candidates: List[Dict] = []
     for candidate_id in range(n_candidates):

@@ -733,20 +733,12 @@ def generate_random_full_candidates_single_k(
         if not has_kmer:
             kmer_options = [f for f in chosen_k_pool if f in remaining_pool_set]
             if not kmer_options:
-                raise ValueError(
-                    f"No kmer feature available for required (k, hash-size)=({chosen_k}, {chosen_hash_size}) "
-                    "after applying required full-model features."
-                )
+                continue
             must_kmer = rng.choice(kmer_options)
             selected.append(must_kmer)
             remaining_pool.remove(must_kmer)
 
         remaining_n = n_features - len(selected)
-        if len(remaining_pool) < remaining_n:
-            raise ValueError(
-                f"Insufficient remaining features to complete full-model candidate: "
-                f"need {remaining_n}, have {len(remaining_pool)}."
-            )
         if remaining_n > 0:
             selected.extend(rng.sample(remaining_pool, remaining_n))
 

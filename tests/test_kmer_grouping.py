@@ -151,6 +151,28 @@ class TestKmerGrouping(unittest.TestCase):
                 seed=23,
             )
 
+    def test_full_candidate_generation_rejects_too_many_required_features(self):
+        with self.assertRaisesRegex(ValueError, "Too many required full-model features"):
+            train_model.generate_random_full_candidates_single_k(
+                models=[("dummy", object())],
+                feature_pool=["gc_mean", "kmer_5_hashjaccard_64"],
+                n_features=1,
+                n_candidates=2,
+                seed=23,
+                required_features=["gc_mean", "kmer_5_hashjaccard_64"],
+            )
+
+    def test_full_candidate_generation_rejects_missing_required_features(self):
+        with self.assertRaisesRegex(ValueError, "Required full-model features are missing"):
+            train_model.generate_random_full_candidates_single_k(
+                models=[("dummy", object())],
+                feature_pool=["gc_mean", "kmer_5_hashjaccard_64"],
+                n_features=2,
+                n_candidates=2,
+                seed=23,
+                required_features=["length_min"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

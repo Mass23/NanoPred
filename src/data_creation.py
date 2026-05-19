@@ -496,6 +496,10 @@ def generate_dataset(
         raise ValueError(f"num_shards must be >= 1, got {num_shards}")
     if not (0 <= shard_id < num_shards):
         raise ValueError(f"shard_id must be in [0, num_shards-1], got {shard_id}/{num_shards}")
+    if num_pairs % 2 != 0:
+        raise ValueError(
+            f"num_pairs must be even to enforce a 50/50 split around real_percent_identity=85, got {num_pairs}"
+        )
 
     # Per-shard RNG seeding — use a hash to ensure well-separated seeds even
     # for consecutive shard IDs rather than simple addition.
@@ -506,6 +510,16 @@ def generate_dataset(
     base_pairs = num_pairs // num_shards
     extra = num_pairs % num_shards
     shard_pairs = base_pairs + (1 if shard_id < extra else 0)
+    global_low_target = num_pairs // 2
+    base_low = global_low_target // num_shards
+    extra_low = global_low_target % num_shards
+    low_target = base_low + (1 if shard_id < extra_low else 0)
+    high_target = shard_pairs - low_target
+    if low_target < 0 or high_target < 0:
+        raise ValueError(
+            f"Invalid shard bucket targets computed for shard {shard_id}: "
+            f"low_target={low_target}, high_target={high_target}, shard_pairs={shard_pairs}"
+        )
 
     # Shard-specific output path
     if num_shards > 1:
@@ -535,17 +549,32 @@ def generate_dataset(
         f"Generating {shard_pairs} pairs "
         f"(shard {shard_id}/{num_shards}, seed {shard_seed}) → {shard_output}"
     )
+    print(
+        f"  Bucket targets for shard {shard_id}: "
+        f"<=85: {low_target}, >85: {high_target}"
+    )
 
     first_chunk = True
     rows_written = 0
-    pairs_generated = 0
+    accepted_low = 0
+    accepted_high = 0
+    attempts = 0
+    max_attempts = max(shard_pairs * 200, shard_pairs + 1)
 
     with tqdm(total=shard_pairs, desc="Generating pairs", unit="pair") as pbar:
-        while pairs_generated < shard_pairs:
-            this_chunk = min(chunk_size, shard_pairs - pairs_generated)
+        while rows_written < shard_pairs:
+            this_chunk = min(chunk_size, shard_pairs - rows_written)
             chunk_rows = []
 
             for _ in range(this_chunk):
+                attempts += 1
+                if attempts > max_attempts:
+                    raise RuntimeError(
+                        "Unable to satisfy balanced bucket targets within "
+                        f"{max_attempts} attempts for shard {shard_id}. "
+                        f"Current counts: <=85={accepted_low}/{low_target}, "
+                        f">85={accepted_high}/{high_target}."
+                    )
                 i = rng.integers(0, n_seq)
                 j = rng.integers(0, n_seq)
                 seq1_raw = sequences[i][1]
@@ -561,6 +590,14 @@ def generate_dataset(
 
                     # Alignment-based percent identity (target variable)
                     pct_id = align_sequences(seq1, seq2)
+                    in_low_bucket = pct_id <= 85.0
+
+                    # Skip expensive downstream metrics/features when this bucket is full.
+                    if in_low_bucket:
+                        if accepted_low >= low_target:
+                            continue
+                    elif accepted_high >= high_target:
+                        continue
 
                     # Per-sequence metrics
                     m1 = compute_metrics(seq1, q1)
@@ -572,6 +609,13 @@ def generate_dataset(
                     row = {'real_percent_identity': pct_id}
                     row.update(pair_feats)
                     chunk_rows.append(row)
+                    if in_low_bucket:
+                        accepted_low += 1
+                    else:
+                        accepted_high += 1
+
+                    if rows_written + len(chunk_rows) >= shard_pairs:
+                        break
 
                 except (ValueError, TypeError, ZeroDivisionError, StopIteration) as exc:
                     import warnings
@@ -588,11 +632,12 @@ def generate_dataset(
                 )
                 first_chunk = False
                 rows_written += len(chunk_rows)
+                pbar.update(len(chunk_rows))
 
-            pairs_generated += this_chunk
-            pbar.update(this_chunk)
-
-    print(f"Done. Wrote {rows_written} rows to {shard_output}.")
+    print(
+        f"Done. Wrote {rows_written} rows to {shard_output} "
+        f"(<=85: {accepted_low}, >85: {accepted_high})."
+    )
 
 
 # ---------------------------------------------------------------------------

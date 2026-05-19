@@ -77,6 +77,7 @@ class TestKmerGrouping(unittest.TestCase):
         self.assertEqual(train_model.extract_kmer_k("kmer_5_hashjaccard_64"), 5)
         self.assertEqual(train_model.extract_kmer_k("kmer_foo_7_256__log"), 7)
         self.assertIsNone(train_model.extract_kmer_k("kmer_bucket_5"))
+        self.assertIsNone(train_model.extract_kmer_k("kmer_5x_hashjaccard_64"))
         self.assertIsNone(train_model.extract_kmer_k("quality_hash_64"))
 
     def test_full_candidate_generation_constrains_to_single_k(self):

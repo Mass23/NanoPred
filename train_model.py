@@ -54,7 +54,6 @@ import argparse
 import json
 import os
 import random as rnd
-import re
 from typing import Dict, List, Optional, Tuple
 
 import joblib
@@ -175,7 +174,7 @@ def extract_kmer_k(base_feature: str) -> Optional[int]:
     base = base_name(base_feature)
     if get_feature_prefix(base) != KMER_PREFIX:
         return None
-    numeric_tokens = [int(tok) for tok in re.findall(r"\d+", base)]
+    numeric_tokens = [int(tok) for tok in base.split("_") if tok.isdigit()]
     if len(numeric_tokens) < 2:
         return None
     # Naming convention is permissive; for names like ..._5_64, k is the

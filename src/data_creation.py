@@ -606,7 +606,7 @@ def generate_dataset(
     low_written = 0
     high_written = 0
     total_attempts = 0
-    max_total_attempts = max(1_000_000, shard_pairs * 200)
+    max_total_attempts = 10_000_000
 
     with tqdm(total=shard_pairs, desc="Generating pairs", unit="pair") as pbar:
         while rows_written < shard_pairs:

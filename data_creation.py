@@ -15,11 +15,12 @@ Usage:
 """
 
 import argparse
+import csv
 import os
 import subprocess
 import sys
 
-from src.data_creation import generate_dataset, merge_shards
+from src.data_creation import BALANCE_THRESHOLD, generate_dataset, merge_shards
 
 
 def _expected_rows(num_pairs: int, num_shards: int, shard_id: int) -> int:
@@ -37,18 +38,41 @@ def _validate_shard_row_counts(output_csv: str, num_pairs: int, num_shards: int)
     proceed when this function returns without raising.
     """
     base, ext = os.path.splitext(output_csv)
+    low_total = num_pairs // 2
     errors = []
     for shard_id in range(num_shards):
         shard_path = f"{base}.part{shard_id}{ext}"
         expected = _expected_rows(num_pairs, num_shards, shard_id)
+        expected_low = _expected_rows(low_total, num_shards, shard_id)
+        expected_high = expected - expected_low
         if not os.path.exists(shard_path):
             errors.append(f"  shard {shard_id}: file missing ({shard_path})")
             continue
-        with open(shard_path) as f:
-            actual = sum(1 for _ in f) - 1  # subtract header line
+        actual = 0
+        actual_low = 0
+        actual_high = 0
+        with open(shard_path, newline="") as f:
+            reader = csv.DictReader(f)
+            if "real_percent_identity" not in (reader.fieldnames or []):
+                errors.append(
+                    f"  shard {shard_id}: missing 'real_percent_identity' column ({shard_path})"
+                )
+                continue
+            for row in reader:
+                actual += 1
+                pct_id = float(row["real_percent_identity"])
+                if pct_id <= BALANCE_THRESHOLD:
+                    actual_low += 1
+                else:
+                    actual_high += 1
         if actual != expected:
             errors.append(
                 f"  shard {shard_id}: expected {expected} rows, got {actual} ({shard_path})"
+            )
+        if actual_low != expected_low or actual_high != expected_high:
+            errors.append(
+                f"  shard {shard_id}: expected <=85/>85 = "
+                f"{expected_low}/{expected_high}, got {actual_low}/{actual_high} ({shard_path})"
             )
     if errors:
         raise ValueError(
@@ -142,6 +166,11 @@ def main():
         ),
     )
     args = parser.parse_args()
+    if args.num_pairs % 2 != 0:
+        parser.error(
+            "--num-pairs must be even to enforce a 50/50 split around "
+            f"real_percent_identity={BALANCE_THRESHOLD:g}"
+        )
 
     if args.num_pairs % 2 != 0:
         parser.error("--num-pairs must be even to produce a balanced <=85 and >85 dataset")

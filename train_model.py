@@ -4,10 +4,10 @@ train_model.py - Simplified two-model training workflow for NanoPred.
 Workflow overview:
   1) FAST MODEL candidate search (binary classification, <85 vs >=85):
      - Build a balanced 10,000-row candidate-search subset.
-     - Generate 500 random candidates.
+     - Generate 2000 random candidates.
      - Each candidate picks:
          * one classifier from get_base_classifiers()
-         * exactly 5 random GC/length/quality features (no kmer features)
+         * exactly 6 random GC/length/quality features (no kmer features)
      - Select winner by highest precision among candidates with recall > 0.99
        on held-out selection data.
        Fallback if none satisfy recall > 0.99: highest recall, then precision.
@@ -23,13 +23,14 @@ Workflow overview:
 
   3) FULL MODEL candidate search (regression, 85 <= y <= 100):
      - Build a 10,000-row candidate-search subset from the high-identity rows.
-     - Generate 500 random candidates.
+     - Generate 2000 random candidates.
      - Each candidate picks:
          * one regressor from get_base_regressors()
-         * exactly 10 random features
+         * exactly 18 total features
          * feature set must include at least one kmer feature
-         * kmer features must all use exactly one chosen k value
-           (e.g. k=3, k=5, or k=7), while allowing multiple hash sizes for that k
+         * every candidate must include all selected fast-model features
+         * kmer features must all use exactly one chosen (k, hash-size) configuration
+           (e.g. k=5 with hash=64, or k=5 with hash=128)
      - Winner metric: lowest held-out RMSE on the high-identity subset
        (tie-breaks: higher R², then lower MAE).
 
@@ -79,7 +80,7 @@ TARGET_RECALL = 0.99
 
 FAST_CANDIDATE_SUBSET_SIZE = 10_000
 FULL_CANDIDATE_SUBSET_SIZE = 10_000
-N_RANDOM_CANDIDATES = 500
+N_RANDOM_CANDIDATES = 2000
 
 FAST_FEATURE_COUNT = 6
 FULL_FEATURE_COUNT = 18
@@ -180,6 +181,17 @@ def extract_kmer_k(base_feature: str) -> Optional[int]:
     # Naming convention is permissive; for names like ..._5_64, k is the
     # second-to-last numeric token and hash size is the last token.
     return numeric_tokens[-2]
+
+
+def extract_kmer_hash_size(base_feature: str) -> Optional[int]:
+    """Extract hash size from names like kmer_5_hashjaccard_64 (returns 64)."""
+    base = base_name(base_feature)
+    if get_feature_prefix(base) != KMER_PREFIX:
+        return None
+    numeric_tokens = [int(tok) for tok in base.split("_") if tok.isdigit()]
+    if len(numeric_tokens) < 2:
+        return None
+    return numeric_tokens[-1]
 
 
 # =========================================================
@@ -648,55 +660,97 @@ def generate_random_full_candidates_single_k(
     n_features: int,
     n_candidates: int,
     seed: int,
+    required_features: Optional[List[str]] = None,
 ) -> List[Dict]:
-    """Generate full-model candidates constrained to exactly one chosen k value."""
+    """Generate full-model candidates constrained to one chosen (k, hash-size) kmer config."""
     rng = rnd.Random(seed)
+    seen_required = set()
+    required_core: List[str] = []
+    for feature in (required_features or []):
+        if feature in seen_required:
+            continue
+        seen_required.add(feature)
+        required_core.append(feature)
+
+    if len(required_core) > n_features:
+        raise ValueError(
+            f"Too many required full-model features: {len(required_core)} required for n_features={n_features}."
+        )
+    missing_required = [f for f in required_core if f not in feature_pool]
+    if missing_required:
+        raise ValueError(f"Required full-model features are missing from feature pool: {missing_required[:5]}.")
 
     kmer_like_features: List[str] = []
     non_kmer_pool: List[str] = []
-    kmer_groups: Dict[int, List[str]] = {}
+    kmer_groups: Dict[Tuple[int, int], List[str]] = {}
     for feature in feature_pool:
         base = base_name(feature)
         if get_feature_prefix(base) == KMER_PREFIX:
             kmer_like_features.append(feature)
             k_val = extract_kmer_k(base)
-            if k_val is not None:
-                kmer_groups.setdefault(k_val, []).append(feature)
+            hash_size = extract_kmer_hash_size(base)
+            if k_val is not None and hash_size is not None:
+                kmer_groups.setdefault((k_val, hash_size), []).append(feature)
         else:
             non_kmer_pool.append(feature)
 
-    valid_k_values = [
-        k_val
-        for k_val, k_features in kmer_groups.items()
-        if len(non_kmer_pool) + len(k_features) >= n_features and len(k_features) > 0
-    ]
-    if not valid_k_values:
+    valid_k_configs: List[Tuple[int, int]] = []  # entries are (k_value, hash_size)
+    for k_config, k_features in kmer_groups.items():
+        candidate_pool = non_kmer_pool + k_features
+        if len(candidate_pool) < n_features:
+            continue
+        if any(req_feature not in candidate_pool for req_feature in required_core):
+            continue
+        remaining_available = [f for f in candidate_pool if f not in required_core]
+        if len(remaining_available) < (n_features - len(required_core)):
+            continue
+        valid_k_configs.append(k_config)
+
+    if not valid_k_configs:
         kmer_sample = ", ".join(kmer_like_features[:5]) if kmer_like_features else "<none>"
-        discovered_groups = {k: len(v) for k, v in sorted(kmer_groups.items())}
+        discovered_groups = {
+            f"k={k_val},hash={hash_size}": len(v)
+            for (k_val, hash_size), v in sorted(kmer_groups.items())
+        }
         raise ValueError(
-            "Full model requires kmer features grouped by k, but no valid k groups were found. "
+            "Full model requires kmer features grouped by (k, hash), but no valid (k, hash-size) groups were found. "
             f"Found {len(kmer_like_features)} kmer-like columns (sample: {kmer_sample}). "
-            f"Parsed k groups: {discovered_groups}."
+            f"Parsed k/hash groups: {discovered_groups}."
         )
 
     candidates: List[Dict] = []
     for candidate_id in range(n_candidates):
         model_name, model = rng.choice(models)
-        chosen_k = rng.choice(valid_k_values)
-        chosen_k_pool = kmer_groups[chosen_k]
+        chosen_k, chosen_hash_size = rng.choice(valid_k_configs)
+        chosen_k_pool = kmer_groups[(chosen_k, chosen_hash_size)]
+        chosen_k_pool_set = set(chosen_k_pool)
         candidate_pool = non_kmer_pool + chosen_k_pool
-        features = draw_random_feature_set(
-            rng=rng,
-            feature_pool=candidate_pool,
-            n_features=n_features,
-            required_pool=chosen_k_pool,  # require at least one kmer from this chosen k
-        )
+        selected = list(required_core)
+        remaining_pool = [f for f in candidate_pool if f not in selected]
+        remaining_pool_set = set(remaining_pool)
+
+        has_kmer = any(f in chosen_k_pool_set for f in selected)
+        if not has_kmer:
+            kmer_options = [f for f in chosen_k_pool if f in remaining_pool_set]
+            if not kmer_options:
+                continue
+            must_kmer = rng.choice(kmer_options)
+            selected.append(must_kmer)
+            remaining_pool.remove(must_kmer)
+
+        remaining_n = n_features - len(selected)
+        if remaining_n > 0:
+            selected.extend(rng.sample(remaining_pool, remaining_n))
+
         candidates.append({
             'candidate_id': candidate_id,
             'model_name': model_name,
             'model': model,
-            'features': features,
+            'features': selected,
             'chosen_kmer_k': chosen_k,
+            'chosen_kmer_hash_size': chosen_hash_size,
+            # Keep combined config for explicit metadata while preserving legacy scalar keys.
+            'chosen_kmer_config': {'k_value': chosen_k, 'hash_size': chosen_hash_size},
         })
     return candidates
 
@@ -800,6 +854,8 @@ def evaluate_and_select_full_candidate(
             'eval_rmse': metrics_eval['rmse'],
             'model_obj': model,
             'chosen_kmer_k': cand.get('chosen_kmer_k'),
+            'chosen_kmer_hash_size': cand.get('chosen_kmer_hash_size'),
+            'chosen_kmer_config': cand.get('chosen_kmer_config'),
             'refinement_changes': cand.get('refinement_changes', {}),
         })
 
@@ -864,6 +920,8 @@ def build_refinement_candidates(
         'model': clone(base_model),
         'features': winner['features'],
         'chosen_kmer_k': winner.get('chosen_kmer_k'),
+        'chosen_kmer_hash_size': winner.get('chosen_kmer_hash_size'),
+        'chosen_kmer_config': winner.get('chosen_kmer_config'),
         'refinement_changes': {},
     }]
 
@@ -887,6 +945,8 @@ def build_refinement_candidates(
                 'model': tuned_model,
                 'features': winner['features'],
                 'chosen_kmer_k': winner.get('chosen_kmer_k'),
+                'chosen_kmer_hash_size': winner.get('chosen_kmer_hash_size'),
+                'chosen_kmer_config': winner.get('chosen_kmer_config'),
                 'refinement_changes': {param_name: scaled_value},
             })
             candidate_id += 1
@@ -1176,6 +1236,8 @@ def retrain_full_model(
         'model_name': winner['model_name'],
         'features': features,
         'chosen_kmer_k': winner.get('chosen_kmer_k'),
+        'chosen_kmer_hash_size': winner.get('chosen_kmer_hash_size'),
+        'chosen_kmer_config': winner.get('chosen_kmer_config'),
         'refinement_changes': winner.get('refinement_changes', {}),
         'selection_metric': 'heldout_rmse_85_100',
         'train_metrics': compute_regression_metrics(y_train.values, train_pred),
@@ -1236,6 +1298,8 @@ def save_final_artifacts(
         'selected_model_name': full_result['model_name'],
         'selected_features': full_result['features'],
         'selected_kmer_k': full_result.get('chosen_kmer_k'),
+        'selected_kmer_hash_size': full_result.get('chosen_kmer_hash_size'),
+        'selected_kmer_config': full_result.get('chosen_kmer_config'),
         'selected_hyperparameter_changes': full_result.get('refinement_changes', {}),
         'selection_metric': full_result['selection_metric'],
         'train_metrics': full_result['train_metrics'],
@@ -1291,7 +1355,7 @@ def main() -> None:
         '--n-candidates',
         type=int,
         default=N_RANDOM_CANDIDATES,
-        help='Number of random candidates to evaluate per model type (default: 500).',
+        help='Number of random candidates to evaluate per model type (default: 2000).',
     )
     args = parser.parse_args()
 
@@ -1400,6 +1464,7 @@ def main() -> None:
         n_features=FULL_FEATURE_COUNT,
         n_candidates=args.n_candidates,
         seed=args.seed + 101,
+        required_features=fast_winner['features'],
     )
 
     full_winner, full_candidate_rows = evaluate_and_select_full_candidate(
@@ -1414,7 +1479,8 @@ def main() -> None:
         f"Full winner: {full_winner['model_name']} "
         f"| eval_rmse={full_winner['eval_rmse']:.4f} "
         f"| eval_r2={full_winner['eval_r2']:.4f} "
-        f"| chosen_k={full_winner.get('chosen_kmer_k')}"
+        f"| chosen_k={full_winner.get('chosen_kmer_k')} "
+        f"| chosen_hash={full_winner.get('chosen_kmer_hash_size')}"
     )
 
     # 4) Winner refinement
@@ -1448,7 +1514,8 @@ def main() -> None:
         f"  Full refinement — train: {full_refinement_summary['train_total']:,} "
         f"| test: {full_refinement_summary['eval_total']:,} "
         f"| winner: {refined_full_winner['model_name']} "
-        f"| chosen_k={refined_full_winner.get('chosen_kmer_k')}"
+        f"| chosen_k={refined_full_winner.get('chosen_kmer_k')} "
+        f"| chosen_hash={refined_full_winner.get('chosen_kmer_hash_size')}"
     )
 
     # 5) Final retraining
@@ -1490,7 +1557,8 @@ def main() -> None:
         'eval_size': int(len(X_full_eval)),
         'n_candidates': int(len(full_candidate_rows)),
         'selection_rule': (
-            'lowest held-out RMSE on 85–100 candidate subset with exactly one chosen kmer k '
+            'lowest held-out RMSE on 85–100 candidate subset with all fast-model features '
+            'and exactly one chosen kmer (k, hash-size) configuration '
             '(tie: higher R², then lower MAE)'
         ),
         'winner_eval_metrics': {
@@ -1498,6 +1566,8 @@ def main() -> None:
             'r2': refined_full_winner['eval_r2'],
             'mae': refined_full_winner['eval_mae'],
             'chosen_kmer_k': refined_full_winner.get('chosen_kmer_k'),
+            'chosen_kmer_hash_size': refined_full_winner.get('chosen_kmer_hash_size'),
+            'chosen_kmer_config': refined_full_winner.get('chosen_kmer_config'),
         },
         'winner_refinement': full_refinement_summary,
     }

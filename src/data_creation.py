@@ -495,6 +495,10 @@ def compute_pair_features(m1: dict, m2: dict) -> dict:
 # Dataset generation
 # ---------------------------------------------------------------------------
 
+BALANCE_THRESHOLD = 85.0
+MAX_BALANCE_ATTEMPTS_MULTIPLIER = 50
+
+
 def generate_dataset(
     fasta_paths: Union[str, List[str]],
     num_pairs: int,
@@ -547,6 +551,7 @@ def generate_dataset(
     if num_pairs % 2 != 0:
         raise ValueError(
             f"num_pairs must be even to produce a balanced dataset, got {num_pairs}"
+
         )
 
     # Per-shard RNG seeding — use a hash to ensure well-separated seeds even
@@ -562,6 +567,16 @@ def generate_dataset(
     # Each shard targets equal low / high halves.
     shard_low_target = shard_pairs // 2
     shard_high_target = shard_pairs - shard_low_target
+    global_low_target = num_pairs // 2
+    base_low = global_low_target // num_shards
+    extra_low = global_low_target % num_shards
+    low_target = base_low + (1 if shard_id < extra_low else 0)
+    high_target = shard_pairs - low_target
+    if low_target < 0 or high_target < 0:
+        raise ValueError(
+            f"Invalid shard bucket targets computed for shard {shard_id}: "
+            f"low_target={low_target}, high_target={high_target}, shard_pairs={shard_pairs}"
+        )
 
     # Shard-specific output path
     if num_shards > 1:
@@ -598,7 +613,8 @@ def generate_dataset(
         f"(shard {shard_id}/{num_shards}, seed {shard_seed}) → {shard_output}"
     )
     print(
-        f"  Balance targets: <=85%: {shard_low_target}, >85%: {shard_high_target}"
+        f"  Bucket targets for shard {shard_id}: "
+        f"<=85: {low_target}, >85: {high_target}"
     )
 
     first_chunk = True
@@ -626,6 +642,17 @@ def generate_dataset(
                     i = int(rng.integers(0, n_seq))
                     j = int(rng.integers(0, n_seq))
 
+            for _ in range(this_chunk):
+                attempts += 1
+                if attempts > max_attempts:
+                    raise RuntimeError(
+                        "Unable to satisfy balanced bucket targets within "
+                        f"{max_attempts} attempts for shard {shard_id}. "
+                        f"Current counts: <=85={accepted_low}/{low_target}, "
+                        f">85={accepted_high}/{high_target}."
+                    )
+                i = rng.integers(0, n_seq)
+                j = rng.integers(0, n_seq)
                 seq1_raw = sequences[i][1]
                 seq2_raw = sequences[j][1]
 
@@ -639,6 +666,13 @@ def generate_dataset(
 
                     # Alignment-based percent identity (target variable)
                     pct_id = align_sequences(seq1, seq2)
+                    in_low_bucket = pct_id <= BALANCE_THRESHOLD
+
+                    # Skip expensive downstream metrics/features when this bucket is full.
+                    if (in_low_bucket and accepted_low >= low_target) or (
+                        not in_low_bucket and accepted_high >= high_target
+                    ):
+                        continue
 
                     # Route to the appropriate bucket; skip if that bucket is full.
                     if pct_id <= 85:
@@ -660,6 +694,10 @@ def generate_dataset(
                     row = {'real_percent_identity': pct_id}
                     row.update(pair_feats)
                     chunk_rows.append(row)
+                    if in_low_bucket:
+                        accepted_low += 1
+                    else:
+                        accepted_high += 1
 
                 except (ValueError, TypeError, ZeroDivisionError, StopIteration) as exc:
                     import warnings
@@ -683,7 +721,7 @@ def generate_dataset(
     print(
         f"Done. Wrote {rows_written} rows to {shard_output}. "
         f"(<=85: {low_written}, >85: {high_written})"
-    )
+                pbar.update(len(chunk_rows))
 
 
 # ---------------------------------------------------------------------------

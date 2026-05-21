@@ -58,6 +58,45 @@ def load_fasta(fasta_path: str) -> list:
 
 
 # ---------------------------------------------------------------------------
+# GC-content binning
+# ---------------------------------------------------------------------------
+
+GC_BINS = 10  # Default number of GC-content bins
+
+
+def build_gc_bins(sequences: list, n_bins: int = GC_BINS) -> list:
+    """Partition sequence indices into *n_bins* equal-width GC-content bins.
+
+    Each bin covers a ``[k/n_bins, (k+1)/n_bins)`` fraction of GC content
+    (the last bin is inclusive on both ends).  Empty bins are omitted so that
+    callers never receive an empty index list.
+
+    This index structure is used by :func:`generate_dataset` to preferentially
+    sample pairs from the same GC-content bin when looking for high-identity
+    (>85 %) pairs, since sequence identity is strongly correlated with similar
+    GC composition.
+
+    Args:
+        sequences: List of ``(id, seq)`` tuples as returned by
+                   :func:`load_fasta`.
+        n_bins:    Number of bins (default 10 → bins of 0–10 %, 10–20 %, …).
+
+    Returns:
+        List of lists; each inner list contains the integer indices (into
+        *sequences*) whose sequences fall into that GC bin.  Only non-empty
+        bins are returned.
+    """
+    bins: list = [[] for _ in range(n_bins)]
+    for idx, (_, seq) in enumerate(sequences):
+        if not seq:
+            continue
+        gc = (seq.count('G') + seq.count('C')) / len(seq)
+        bin_idx = min(int(gc * n_bins), n_bins - 1)
+        bins[bin_idx].append(idx)
+    return [b for b in bins if b]
+
+
+# ---------------------------------------------------------------------------
 # Pair creation
 # ---------------------------------------------------------------------------
 
@@ -468,26 +507,35 @@ def generate_dataset(
     num_shards: int = 1,
 ) -> None:
     """
-    Generate a dataset of num_pairs sequence pairs with computed features.
+    Generate a balanced dataset of num_pairs sequence pairs with computed features.
+
+    The final dataset has an equal number of rows with ``real_percent_identity``
+    <= 85 and > 85 (the two halves of *num_pairs*).  Pair selection is guided by
+    GC-content bins: when looking for a high-identity pair, two sequences are
+    drawn from the **same** GC-content bin (similar GC → more likely to be
+    similar), which dramatically reduces wasted alignment calls.  Low-identity
+    pairs are drawn fully at random.
 
     Sharding support:
         When num_shards > 1, this function generates only the pairs assigned to
         *shard_id* (0-indexed) and writes them to a shard-specific file:
             <base>.part{shard_id}<ext>   (e.g. all_pairs_data.part3.csv)
-        Each shard uses an independent RNG seeded with ``seed + shard_id`` so
-        results are fully reproducible regardless of execution order.
-        Pairs are sampled on the fly — no large list is pre-allocated.
+        Each shard uses an independent RNG seeded with a hash of ``(seed,
+        shard_id)`` so results are fully reproducible regardless of execution
+        order.  Pairs are sampled on the fly — no large list is pre-allocated.
 
     Args:
         fasta_paths: Path (str) or list of paths to input FASTA file(s).
                      When multiple files are provided, all sequences are pooled
                      together before pair generation.
         num_pairs:   Total number of pairs across all shards (e.g. 500_000).
+                     Must be even so each shard can hold equal low/high halves.
         output_csv:  Output CSV path.  When num_shards > 1, the shard index is
                      inserted before the file extension.
         primer5:     Forward primer sequence (optional).
         primer3:     Reverse primer sequence (optional).
-        seed:        Global random seed.  Per-shard seed = seed + shard_id.
+        seed:        Global random seed.  Per-shard seed derived from seed and
+                     shard_id.
         chunk_size:  Number of pairs to process per batch before writing.
         shard_id:    Index of this shard (0 .. num_shards-1).  Default 0.
         num_shards:  Total number of shards.  Default 1 (no sharding).
@@ -496,16 +544,24 @@ def generate_dataset(
         raise ValueError(f"num_shards must be >= 1, got {num_shards}")
     if not (0 <= shard_id < num_shards):
         raise ValueError(f"shard_id must be in [0, num_shards-1], got {shard_id}/{num_shards}")
+    if num_pairs % 2 != 0:
+        raise ValueError(
+            f"num_pairs must be even to produce a balanced dataset, got {num_pairs}"
+        )
 
     # Per-shard RNG seeding — use a hash to ensure well-separated seeds even
     # for consecutive shard IDs rather than simple addition.
     shard_seed = hash((seed, shard_id)) & 0xFFFFFFFF
     rng = np.random.default_rng(shard_seed)
 
-    # Number of pairs assigned to this shard
+    # Number of pairs assigned to this shard (always even by construction since
+    # num_pairs is even and the split is symmetric).
     base_pairs = num_pairs // num_shards
     extra = num_pairs % num_shards
     shard_pairs = base_pairs + (1 if shard_id < extra else 0)
+    # Each shard targets equal low / high halves.
+    shard_low_target = shard_pairs // 2
+    shard_high_target = shard_pairs - shard_low_target
 
     # Shard-specific output path
     if num_shards > 1:
@@ -531,23 +587,57 @@ def generate_dataset(
 
     n_seq = len(sequences)
 
+    # Build GC-content bins for guided high-identity sampling.
+    gc_bins = build_gc_bins(sequences)
+    gc_bins_arr = [np.array(b, dtype=np.intp) for b in gc_bins]
+    n_gc_bins = len(gc_bins_arr)
+    print(f"  Built {n_gc_bins} non-empty GC-content bin(s) for guided sampling.")
+
     print(
         f"Generating {shard_pairs} pairs "
         f"(shard {shard_id}/{num_shards}, seed {shard_seed}) → {shard_output}"
     )
+    print(
+        f"  Balance targets: <=85%: {shard_low_target}, >85%: {shard_high_target}"
+    )
 
     first_chunk = True
     rows_written = 0
-    pairs_generated = 0
+    low_written = 0
+    high_written = 0
+    total_attempts = 0
+    max_total_attempts = max(1_000_000, shard_pairs * 20_000)
 
     with tqdm(total=shard_pairs, desc="Generating pairs", unit="pair") as pbar:
-        while pairs_generated < shard_pairs:
-            this_chunk = min(chunk_size, shard_pairs - pairs_generated)
+        while rows_written < shard_pairs:
+            this_chunk = min(chunk_size, shard_pairs - rows_written)
             chunk_rows = []
+            chunk_low = 0
+            chunk_high = 0
 
-            for _ in range(this_chunk):
-                i = rng.integers(0, n_seq)
-                j = rng.integers(0, n_seq)
+            while len(chunk_rows) < this_chunk:
+                total_attempts += 1
+                if total_attempts > max_total_attempts:
+                    raise RuntimeError(
+                        "Unable to satisfy balancing targets within sampling limit. "
+                        f"Written so far: <=85={low_written}, >85={high_written}; "
+                        f"targets: <=85={shard_low_target}, >85={shard_high_target}."
+                    )
+
+                still_need_high = (high_written + chunk_high) < shard_high_target
+                still_need_low = (low_written + chunk_low) < shard_low_target
+
+                if still_need_high and (not still_need_low or rng.random() < 0.5):
+                    # Sample two sequences from the same GC bin to boost the
+                    # probability of a high-identity (>85 %) alignment.
+                    bin_arr = gc_bins_arr[rng.integers(0, n_gc_bins)]
+                    i = int(bin_arr[rng.integers(0, len(bin_arr))])
+                    j = int(bin_arr[rng.integers(0, len(bin_arr))])
+                else:
+                    # Sample fully at random for low-identity pairs.
+                    i = int(rng.integers(0, n_seq))
+                    j = int(rng.integers(0, n_seq))
+
                 seq1_raw = sequences[i][1]
                 seq2_raw = sequences[j][1]
 
@@ -561,6 +651,16 @@ def generate_dataset(
 
                     # Alignment-based percent identity (target variable)
                     pct_id = align_sequences(seq1, seq2)
+
+                    # Route to the appropriate bucket; skip if that bucket is full.
+                    if pct_id <= 85:
+                        if (low_written + chunk_low) >= shard_low_target:
+                            continue
+                        chunk_low += 1
+                    else:
+                        if (high_written + chunk_high) >= shard_high_target:
+                            continue
+                        chunk_high += 1
 
                     # Per-sequence metrics
                     m1 = compute_metrics(seq1, q1)
@@ -588,11 +688,14 @@ def generate_dataset(
                 )
                 first_chunk = False
                 rows_written += len(chunk_rows)
+                low_written += chunk_low
+                high_written += chunk_high
+                pbar.update(len(chunk_rows))
 
-            pairs_generated += this_chunk
-            pbar.update(this_chunk)
-
-    print(f"Done. Wrote {rows_written} rows to {shard_output}.")
+    print(
+        f"Done. Wrote {rows_written} rows to {shard_output}. "
+        f"(<=85: {low_written}, >85: {high_written})"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -143,7 +143,9 @@ def main():
     )
     args = parser.parse_args()
 
-    # ------------------------------------------------------------------
+    if args.num_pairs % 2 != 0:
+        parser.error("--num-pairs must be even to produce a balanced <=85 and >85 dataset")
+
     # Orchestrator mode: spawn all shards then validate and merge.
     # ------------------------------------------------------------------
     if args.merge and args.num_shards > 1:

@@ -605,9 +605,6 @@ def generate_dataset(
     rows_written = 0
     low_written = 0
     high_written = 0
-    total_attempts = 0
-    max_total_attempts = 10_000_000
-
     with tqdm(total=shard_pairs, desc="Generating pairs", unit="pair") as pbar:
         while rows_written < shard_pairs:
             this_chunk = min(chunk_size, shard_pairs - rows_written)
@@ -615,16 +612,7 @@ def generate_dataset(
             chunk_low = 0
             chunk_high = 0
 
-            while len(chunk_rows) < this_chunk:
-                total_attempts += 1
-                if total_attempts > max_total_attempts:
-                    raise RuntimeError(
-                        "Unable to satisfy balancing targets within sampling limit. "
-                        f"Written so far: <=85={low_written}, >85={high_written}; "
-                        f"targets: <=85={shard_low_target}, >85={shard_high_target}."
-                    )
-
-                still_need_high = (high_written + chunk_high) < shard_high_target
+            while len(chunk_rows) < this_chunk:                still_need_high = (high_written + chunk_high) < shard_high_target
                 still_need_low = (low_written + chunk_low) < shard_low_target
 
                 if still_need_high and (not still_need_low or rng.random() < 0.5):

@@ -196,6 +196,8 @@ class TestGenerateDataset(unittest.TestCase):
     ):
         class FakeRng:
             def __init__(self):
+                # Sequence of rng.integers() returns:
+                # high attempt -> bin 0, idx 0, idx 1; low attempt -> idx 0, idx 2.
                 self._ints = iter([0, 0, 1, 0, 2])
 
             def random(self):

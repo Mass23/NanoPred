@@ -644,12 +644,12 @@ def generate_dataset(
                     raise RuntimeError(
                         "Unable to satisfy balanced bucket targets within "
                         f"{max_attempts} attempts for shard {shard_id}. "
-                        f"Current counts: <=85={low_written + chunk_low}/{shard_low_target}, "
-                        f">85={high_written + chunk_high}/{shard_high_target}."
+                        f"Current counts: <=85={low_written + chunk_low}/{low_target}, "
+                        f">85={high_written + chunk_high}/{high_target}."
                     )
 
-                still_need_high = (high_written + chunk_high) < shard_high_target
-                still_need_low = (low_written + chunk_low) < shard_low_target
+                still_need_high = (high_written + chunk_high) < high_target
+                still_need_low = (low_written + chunk_low) < low_target
 
                 if not still_need_high and not still_need_low:
                     break
@@ -688,11 +688,11 @@ def generate_dataset(
 
                     # Route to the appropriate bucket; skip if that bucket is full.
                     if in_low_bucket:
-                        if (low_written + chunk_low) >= shard_low_target:
+                        if (low_written + chunk_low) >= low_target:
                             continue
                         chunk_low += 1
                     else:
-                        if (high_written + chunk_high) >= shard_high_target:
+                        if (high_written + chunk_high) >= high_target:
                             continue
                         chunk_high += 1
 

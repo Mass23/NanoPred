@@ -119,7 +119,18 @@ def create_sequence_pairs(sequences: list, num_pairs: int, seed: int = 42) -> li
 # Alignment
 # ---------------------------------------------------------------------------
 
-def align_sequences(seq1: str, seq2: str) -> float:
+def _create_pairwise_aligner() -> PairwiseAligner:
+    """Create the configured PairwiseAligner used for identity scoring."""
+    aligner = PairwiseAligner()
+    aligner.mode = 'global'
+    aligner.match_score = 1
+    aligner.mismatch_score = 0
+    aligner.open_gap_score = -0.5
+    aligner.extend_gap_score = -0.1
+    return aligner
+
+
+def align_sequences(seq1: str, seq2: str, aligner: PairwiseAligner = None) -> float:
     """
     Pairwise global alignment using Biopython PairwiseAligner.
     Returns percent identity in [0, 100].
@@ -127,12 +138,8 @@ def align_sequences(seq1: str, seq2: str) -> float:
     if not seq1 or not seq2:
         return 0.0
 
-    aligner = PairwiseAligner()
-    aligner.mode = 'global'
-    aligner.match_score = 1
-    aligner.mismatch_score = 0
-    aligner.open_gap_score = -0.5
-    aligner.extend_gap_score = -0.1
+    if aligner is None:
+        aligner = _create_pairwise_aligner()
 
     alignments = aligner.align(seq1, seq2)
     best = next(iter(alignments), None)
@@ -601,6 +608,7 @@ def generate_dataset(
     print(f"Total sequences loaded: {len(sequences)}")
 
     n_seq = len(sequences)
+    aligner = _create_pairwise_aligner()
 
     # Build GC-content bins for guided high-identity sampling.
     gc_bins = build_gc_bins(sequences)
@@ -627,11 +635,27 @@ def generate_dataset(
             chunk_rows = []
             chunk_low = 0
             chunk_high = 0
+            attempts = 0
+            max_attempts = max(this_chunk * MAX_BALANCE_ATTEMPTS_MULTIPLIER, 1)
 
-            while len(chunk_rows) < this_chunk:                still_need_high = (high_written + chunk_high) < shard_high_target
-                still_need_low = (low_written + chunk_low) < shard_low_target
+            while len(chunk_rows) < this_chunk:
+                attempts += 1
+                if attempts > max_attempts:
+                    raise RuntimeError(
+                        "Unable to satisfy balanced bucket targets within "
+                        f"{max_attempts} attempts for shard {shard_id}. "
+                        f"Current counts: <=85={low_written + chunk_low}/{low_target}, "
+                        f">85={high_written + chunk_high}/{high_target}."
+                    )
 
-                if still_need_high and (not still_need_low or rng.random() < 0.5):
+                still_need_high = (high_written + chunk_high) < high_target
+                still_need_low = (low_written + chunk_low) < low_target
+
+                if not still_need_high and not still_need_low:
+                    break
+
+                need_high = still_need_high and (not still_need_low or rng.random() < 0.5)
+                if need_high:
                     # Sample two sequences from the same GC bin to boost the
                     # probability of a high-identity (>85 %) alignment.
                     bin_arr = gc_bins_arr[rng.integers(0, n_gc_bins)]
@@ -641,18 +665,6 @@ def generate_dataset(
                     # Sample fully at random for low-identity pairs.
                     i = int(rng.integers(0, n_seq))
                     j = int(rng.integers(0, n_seq))
-
-            for _ in range(this_chunk):
-                attempts += 1
-                if attempts > max_attempts:
-                    raise RuntimeError(
-                        "Unable to satisfy balanced bucket targets within "
-                        f"{max_attempts} attempts for shard {shard_id}. "
-                        f"Current counts: <=85={accepted_low}/{low_target}, "
-                        f">85={accepted_high}/{high_target}."
-                    )
-                i = rng.integers(0, n_seq)
-                j = rng.integers(0, n_seq)
                 seq1_raw = sequences[i][1]
                 seq2_raw = sequences[j][1]
 
@@ -665,22 +677,22 @@ def generate_dataset(
                         continue
 
                     # Alignment-based percent identity (target variable)
-                    pct_id = align_sequences(seq1, seq2)
+                    pct_id = align_sequences(seq1, seq2, aligner=aligner)
                     in_low_bucket = pct_id <= BALANCE_THRESHOLD
 
-                    # Skip expensive downstream metrics/features when this bucket is full.
-                    if (in_low_bucket and accepted_low >= low_target) or (
-                        not in_low_bucket and accepted_high >= high_target
-                    ):
+                    # Keep sampling focused on the currently needed bucket.
+                    if need_high and in_low_bucket:
+                        continue
+                    if (not need_high) and (not in_low_bucket):
                         continue
 
                     # Route to the appropriate bucket; skip if that bucket is full.
-                    if pct_id <= 85:
-                        if (low_written + chunk_low) >= shard_low_target:
+                    if in_low_bucket:
+                        if (low_written + chunk_low) >= low_target:
                             continue
                         chunk_low += 1
                     else:
-                        if (high_written + chunk_high) >= shard_high_target:
+                        if (high_written + chunk_high) >= high_target:
                             continue
                         chunk_high += 1
 
@@ -694,10 +706,14 @@ def generate_dataset(
                     row = {'real_percent_identity': pct_id}
                     row.update(pair_feats)
                     chunk_rows.append(row)
-                    if in_low_bucket:
-                        accepted_low += 1
-                    else:
-                        accepted_high += 1
+                    pbar.update(1)
+                    if attempts % 1000 == 0:
+                        pbar.set_postfix(
+                            attempts=attempts,
+                            low=low_written + chunk_low,
+                            high=high_written + chunk_high,
+                            refresh=False,
+                        )
 
                 except (ValueError, TypeError, ZeroDivisionError, StopIteration) as exc:
                     import warnings
@@ -716,12 +732,11 @@ def generate_dataset(
                 rows_written += len(chunk_rows)
                 low_written += chunk_low
                 high_written += chunk_high
-                pbar.update(len(chunk_rows))
 
     print(
         f"Done. Wrote {rows_written} rows to {shard_output}. "
         f"(<=85: {low_written}, >85: {high_written})"
-                pbar.update(len(chunk_rows))
+    )
 
 
 # ---------------------------------------------------------------------------

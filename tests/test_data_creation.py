@@ -12,6 +12,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -177,6 +178,60 @@ class TestGenerateDataset(unittest.TestCase):
             df1 = pd.read_csv(out1)
             df2 = pd.read_csv(out2)
             self.assertTrue(df1.equals(df2))
+
+    @patch("src.data_creation.compute_pair_features", return_value={"pair_feature": 1.0})
+    @patch("src.data_creation.compute_metrics", return_value={"m": 1})
+    @patch("src.data_creation.process_sequence")
+    @patch("src.data_creation.build_gc_bins", return_value=[[0, 1], [2, 3]])
+    @patch("src.data_creation.load_fasta")
+    @patch("src.data_creation.np.random.default_rng")
+    def test_sampling_strategy_respects_bucket_need(
+        self,
+        mock_default_rng,
+        mock_load_fasta,
+        _mock_gc_bins,
+        mock_process_sequence,
+        _mock_compute_metrics,
+        _mock_compute_pair_features,
+    ):
+        class FakeRng:
+            def __init__(self):
+                self._ints = iter([0, 0, 1, 0, 2])
+
+            def random(self):
+                return 0.0
+
+            def integers(self, _low, _high=None):
+                return next(self._ints)
+
+        fake_rng = FakeRng()
+        mock_default_rng.return_value = fake_rng
+        mock_load_fasta.return_value = [
+            ("s0", "AAAA"),
+            ("s1", "AAAT"),
+            ("s2", "TTTT"),
+            ("s3", "CCCC"),
+        ]
+        mock_process_sequence.side_effect = lambda seq, *_args: (seq, [30] * len(seq), 30.0)
+
+        attempted_pairs = []
+
+        def fake_align(s1, s2, aligner=None):
+            attempted_pairs.append((s1, s2))
+            return 95.0 if {s1, s2} == {"AAAA", "AAAT"} else 20.0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = os.path.join(tmpdir, "out.csv")
+            with patch("src.data_creation.align_sequences", side_effect=fake_align):
+                generate_dataset("fake.fasta", num_pairs=2, output_csv=out, seed=0, chunk_size=2)
+
+            import pandas as pd
+            df = pd.read_csv(out)
+
+        self.assertEqual(df["real_percent_identity"].gt(85).sum(), 1)
+        self.assertEqual(df["real_percent_identity"].le(85).sum(), 1)
+        self.assertEqual(attempted_pairs[0], ("AAAA", "AAAT"))
+        self.assertEqual(attempted_pairs[1], ("AAAA", "TTTT"))
 
 
 if __name__ == "__main__":

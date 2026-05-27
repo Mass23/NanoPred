@@ -1,17 +1,18 @@
 import gzip
 import os
+import subprocess
 import tempfile
 import unittest
+import unittest.mock
 
 import numpy as np
 import pandas as pd
 
 from apply_clustering import (
-    _reverse_complement,
-    trim_read_with_primers,
+    _run_cutadapt,
     build_otu_table,
-    discover_fastq_files,
     dereplicate_fastq_files,
+    discover_fastq_pairs,
     greedy_cluster,
     resolve_selected_features,
     write_output,
@@ -44,24 +45,38 @@ class TestApplyClustering(unittest.TestCase):
 
     def test_discovery_and_dereplication(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            p1 = os.path.join(tmpdir, "sample1.fastq")
-            p2 = os.path.join(tmpdir, "sample2.fq.gz")
-            p3 = os.path.join(tmpdir, "ignore.txt")
-            self._write_fastq(p1, ["AAAA", "AAAA", "CCCC"], gz=False)
-            self._write_fastq(p2, ["AAAA", "GGGG"], gz=True)
-            with open(p3, "w", encoding="utf-8") as handle:
+            r1_s1 = os.path.join(tmpdir, "sample1_R1.fastq")
+            r2_s1 = os.path.join(tmpdir, "sample1_R2.fastq")
+            r1_s2 = os.path.join(tmpdir, "sample2_R1.fq.gz")
+            r2_s2 = os.path.join(tmpdir, "sample2_R2.fq.gz")
+            ignore = os.path.join(tmpdir, "ignore.txt")
+            # sample1 R1: two AAAA + one CCCC; sample1 R2: one CCCC
+            self._write_fastq(r1_s1, ["AAAA", "AAAA", "CCCC"], gz=False)
+            self._write_fastq(r2_s1, ["CCCC"], gz=False)
+            # sample2 R1: one AAAA; sample2 R2: one GGGG
+            self._write_fastq(r1_s2, ["AAAA"], gz=True)
+            self._write_fastq(r2_s2, ["GGGG"], gz=True)
+            with open(ignore, "w", encoding="utf-8") as handle:
                 handle.write("noop")
 
-            files = discover_fastq_files(tmpdir)
-            self.assertEqual(len(files), 2)
+            pairs = discover_fastq_pairs(tmpdir)
+            self.assertEqual(len(pairs), 2)
+            found_samples = {p[2] for p in pairs}
+            self.assertIn("sample1", found_samples)
+            self.assertIn("sample2", found_samples)
 
-            sample_names, table = dereplicate_fastq_files(files)
-            self.assertEqual(sample_names, ["sample1.fastq", "sample2.fq.gz"])
+            sample_names, table = dereplicate_fastq_files(pairs)
+            self.assertEqual(set(sample_names), {"sample1", "sample2"})
+            # AAAA: 2 from sample1_R1 + 1 from sample2_R1 = 3
             self.assertEqual(table["AAAA"]["total_abundance"], 3)
-            self.assertEqual(table["AAAA"]["sample_counts"]["sample1.fastq"], 2)
-            self.assertEqual(table["AAAA"]["sample_counts"]["sample2.fq.gz"], 1)
-            self.assertEqual(table["CCCC"]["total_abundance"], 1)
+            self.assertEqual(table["AAAA"]["sample_counts"]["sample1"], 2)
+            self.assertEqual(table["AAAA"]["sample_counts"]["sample2"], 1)
+            # CCCC: 1 from sample1_R1 + 1 from sample1_R2 = 2
+            self.assertEqual(table["CCCC"]["total_abundance"], 2)
+            self.assertEqual(table["CCCC"]["sample_counts"]["sample1"], 2)
+            # GGGG: 1 from sample2_R2 only
             self.assertEqual(table["GGGG"]["total_abundance"], 1)
+            self.assertEqual(table["GGGG"]["sample_counts"]["sample2"], 1)
 
     def test_greedy_cluster_assigns_and_creates_new_centroid(self):
         global_table = {
@@ -210,101 +225,61 @@ class TestApplyClustering(unittest.TestCase):
             self.assertEqual(int(otu_df.loc[0, "sample2"]), 1)
 
 
-class TestPrimerTrimming(unittest.TestCase):
-    def test_reverse_complement(self):
-        self.assertEqual(_reverse_complement("ATGC"), "GCAT")
-        self.assertEqual(_reverse_complement("AAAA"), "TTTT")
-        self.assertEqual(_reverse_complement("ACGT"), "ACGT")
-        # Mixed case: complement preserves case mapping
-        self.assertEqual(_reverse_complement("atgc"), "gcat")
-        self.assertEqual(_reverse_complement("AtGc"), "gCaT")
+class TestCutadaptTrimming(unittest.TestCase):
+    def test_run_cutadapt_builds_paired_end_command(self):
+        """_run_cutadapt should call cutadapt with -g/-G/-o/-p and both inputs."""
+        fake_result = subprocess.CompletedProcess(args=[], returncode=0, stderr=b"")
+        with unittest.mock.patch("subprocess.run", return_value=fake_result) as mock_run:
+            _run_cutadapt("r1.fastq", "r2.fastq", "o1.fastq", "o2.fastq", "ACGT", "TGCA")
+            cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[0], "cutadapt")
+        self.assertIn("-g", cmd)
+        self.assertEqual(cmd[cmd.index("-g") + 1], "ACGT")
+        self.assertIn("-G", cmd)
+        self.assertEqual(cmd[cmd.index("-G") + 1], "TGCA")
+        self.assertIn("-o", cmd)
+        self.assertEqual(cmd[cmd.index("-o") + 1], "o1.fastq")
+        self.assertIn("-p", cmd)
+        self.assertEqual(cmd[cmd.index("-p") + 1], "o2.fastq")
+        self.assertIn("r1.fastq", cmd)
+        self.assertIn("r2.fastq", cmd)
+        # Paired-end mode does not need --rc
+        self.assertNotIn("--rc", cmd)
 
-    def test_trim_no_primers(self):
-        seq = "ACGTACGT"
-        quality = [30, 30, 30, 30, 30, 30, 30, 30]
-        trimmed_s, trimmed_q = trim_read_with_primers(seq, quality, None, None)
-        self.assertEqual(trimmed_s, seq)
-        self.assertEqual(trimmed_q, quality)
+    def test_run_cutadapt_only_primer5_no_G_flag(self):
+        """With only primer5 supplied, -G should not appear in the command."""
+        fake_result = subprocess.CompletedProcess(args=[], returncode=0, stderr=b"")
+        with unittest.mock.patch("subprocess.run", return_value=fake_result) as mock_run:
+            _run_cutadapt("r1.fastq", "r2.fastq", "o1.fastq", "o2.fastq", "ACGT", None)
+            cmd = mock_run.call_args[0][0]
+        self.assertIn("-g", cmd)
+        self.assertNotIn("-G", cmd)
 
-    def test_trim_both_primers_forward(self):
-        # Sequence: AAA [insert] TTT where AAA=primer5, TTT=primer3
-        seq = "AAACCCGTTTTT"
-        quality = list(range(len(seq)))
-        p5 = "AAA"
-        p3 = "TTT"
-        trimmed_s, trimmed_q = trim_read_with_primers(seq, quality, p5, p3)
-        # After trimming: "CCCG" (between primer5 end and primer3 start)
-        self.assertEqual(trimmed_s, "CCCG")
-        # Quality should align with the trimmed region
-        self.assertEqual(trimmed_q, quality[3:7])
-        self.assertEqual(len(trimmed_s), len(trimmed_q))
+    def test_run_cutadapt_only_primer3_no_g_flag(self):
+        """With only primer3 supplied, -g should not appear in the command."""
+        fake_result = subprocess.CompletedProcess(args=[], returncode=0, stderr=b"")
+        with unittest.mock.patch("subprocess.run", return_value=fake_result) as mock_run:
+            _run_cutadapt("r1.fastq", "r2.fastq", "o1.fastq", "o2.fastq", None, "TGCA")
+            cmd = mock_run.call_args[0][0]
+        self.assertNotIn("-g", cmd)
+        self.assertIn("-G", cmd)
 
-    def test_trim_only_primer5(self):
-        seq = "AAACCCGGG"
-        quality = list(range(len(seq)))
-        trimmed_s, trimmed_q = trim_read_with_primers(seq, quality, "AAA", None)
-        self.assertEqual(trimmed_s, "CCCGGG")
-        self.assertEqual(trimmed_q, quality[3:])
-        self.assertEqual(len(trimmed_s), len(trimmed_q))
+    def test_run_cutadapt_raises_when_not_installed(self):
+        """FileNotFoundError from subprocess should be re-raised as RuntimeError."""
+        with unittest.mock.patch("subprocess.run", side_effect=FileNotFoundError):
+            with self.assertRaises(RuntimeError) as ctx:
+                _run_cutadapt("r1.fastq", "r2.fastq", "o1.fastq", "o2.fastq", "ACGT", "TGCA")
+        self.assertIn("cutadapt", str(ctx.exception))
 
-    def test_trim_only_primer3(self):
-        seq = "CCCGGGTTT"
-        quality = list(range(len(seq)))
-        trimmed_s, trimmed_q = trim_read_with_primers(seq, quality, None, "TTT")
-        self.assertEqual(trimmed_s, "CCCGGG")
-        self.assertEqual(trimmed_q, quality[:6])
-        self.assertEqual(len(trimmed_s), len(trimmed_q))
-
-    def test_trim_not_found_returns_original(self):
-        # Primers not present — relaxed: return unchanged
-        seq = "GGGGGGGG"
-        quality = [20] * len(seq)
-        trimmed_s, trimmed_q = trim_read_with_primers(seq, quality, "AAA", "TTT")
-        self.assertEqual(trimmed_s, seq)
-        self.assertEqual(trimmed_q, quality)
-
-    def test_trim_reverse_complement_orientation(self):
-        # Build a read that comes from the reverse strand:
-        #   read = RC(primer5) + RC(insert) + RC(primer3)
-        # Taking the RC of this read gives: primer3 + insert + primer5.
-        # Use primers that don't appear in their own RC to ensure the forward
-        # pass fails and the RC pass is exercised.
-        p5 = "AACC"   # RC(p5) = "GGTT"
-        p3 = "TTGG"   # RC(p3) = "CCAA"
-        insert = "GCGC"
-        reverse_strand_read = _reverse_complement(p5) + _reverse_complement(insert) + _reverse_complement(p3)
-        # = "GGTT" + "GCGC" + "CCAA" = "GGTTGCGCCCAA"
-        quality = list(range(len(reverse_strand_read)))
-
-        trimmed_s, trimmed_q = trim_read_with_primers(
-            reverse_strand_read, quality, p5, p3
+    def test_run_cutadapt_raises_on_nonzero_exit(self):
+        """A non-zero exit code from cutadapt should be raised as RuntimeError."""
+        failed = subprocess.CompletedProcess(
+            args=[], returncode=1, stderr=b"adapter not found"
         )
-        self.assertEqual(trimmed_s, insert)
-        self.assertEqual(len(trimmed_s), len(trimmed_q))
-
-    def test_dereplication_with_primer_trimming(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Reads: primer5 + insert + primer3
-            # After trimming, inserts should be dereplicated together
-            p1 = os.path.join(tmpdir, "sample1.fastq")
-            p5 = "AAA"
-            p3 = "TTT"
-            with open(p1, "w", encoding="utf-8") as fh:
-                # Two reads with same insert "CCCC" but different flanking primers
-                for rec_seq in ["AAACCCCTTTT", "AAACCCCTTTT", "AAAGGGGTTTT"]:
-                    qual_str = "I" * len(rec_seq)
-                    fh.write(f"@r\n{rec_seq}\n+\n{qual_str}\n")
-
-            files = [p1]
-            sample_names, table = dereplicate_fastq_files(files, primer5=p5, primer3=p3)
-            # "AAACCCCTTTT" → trimmed to "CCCC" (2 copies)
-            # "AAAGGGGTTTT" → trimmed to "GGGG" (1 copy)
-            self.assertIn("CCCC", table)
-            self.assertIn("GGGG", table)
-            self.assertEqual(table["CCCC"]["total_abundance"], 2)
-            self.assertEqual(table["GGGG"]["total_abundance"], 1)
-            # Quality should be aligned: 4 scores for 4-base insert
-            self.assertEqual(len(table["CCCC"]["representative_quality"]), 4)
+        with unittest.mock.patch("subprocess.run", return_value=failed):
+            with self.assertRaises(RuntimeError) as ctx:
+                _run_cutadapt("r1.fastq", "r2.fastq", "o1.fastq", "o2.fastq", "ACGT", "TGCA")
+        self.assertIn("cutadapt", str(ctx.exception))
 
 
 if __name__ == "__main__":

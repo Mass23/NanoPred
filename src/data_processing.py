@@ -28,13 +28,10 @@ def _trim_record_forward(record, primer5, primer3, fmt):
         if idx != -1:
             end = idx
 
-    trimmed_seq = seq[start:end]
-    if not trimmed_seq:
+    if start >= end:
         return None
 
-    new_record = record[start:end]
-    new_record.seq = type(record.seq)(trimmed_seq)
-    return new_record
+    return record[start:end]
 
 
 def _run_cutprimers(input_path, output_path, primer5, primer3, fmt):

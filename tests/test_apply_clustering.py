@@ -11,6 +11,7 @@ import pandas as pd
 from apply_clustering import (
     _run_cutadapt,
     build_otu_table,
+    compute_sequence_metrics_cache,
     dereplicate_fastq_files,
     discover_fastq_files,
     greedy_cluster,
@@ -34,6 +35,26 @@ class MockFullModel:
 
 class MockModelWithFeatures:
     feature_names_in_ = np.array(["length_diff"])
+
+
+class BatchCountingFastModel:
+    def __init__(self):
+        self.batch_sizes = []
+
+    def predict_proba(self, X):
+        self.batch_sizes.append(len(X))
+        probs = np.full(len(X), 0.9)
+        return np.vstack([1.0 - probs, probs]).T
+
+
+class BatchCountingFullModel:
+    def __init__(self):
+        self.batch_sizes = []
+
+    def predict(self, X):
+        self.batch_sizes.append(len(X))
+        vals = X["length_diff"].to_numpy()
+        return np.where(vals <= 0.0, 98.0, 80.0)
 
 
 class TestApplyClustering(unittest.TestCase):
@@ -101,6 +122,7 @@ class TestApplyClustering(unittest.TestCase):
 
         rows = greedy_cluster(
             global_table=global_table,
+            metric_cache=compute_sequence_metrics_cache(global_table),
             fast_model=MockFastModel(),
             full_model=MockFullModel(),
             fast_features=["length_diff"],
@@ -117,6 +139,50 @@ class TestApplyClustering(unittest.TestCase):
         self.assertTrue(by_id["id_c"]["is_centroid"])
         self.assertEqual(by_id["id_c"]["otu_id"], "OTU_2")
         self.assertNotEqual(by_id["id_c"]["otu_id"], by_id["id_a"]["otu_id"])
+
+    def test_greedy_cluster_batches_centroid_inference(self):
+        global_table = {
+            "AAAA": {
+                "sequence": "AAAA",
+                "sequence_id": "id_a",
+                "total_abundance": 10,
+                "sample_counts": {"s1": 10},
+                "representative_quality": [40] * 4,
+            },
+            "CCCCCCCC": {
+                "sequence": "CCCCCCCC",
+                "sequence_id": "id_b",
+                "total_abundance": 6,
+                "sample_counts": {"s1": 6},
+                "representative_quality": [40] * 8,
+            },
+            "GGGGGGGG": {
+                "sequence": "GGGGGGGG",
+                "sequence_id": "id_c",
+                "total_abundance": 5,
+                "sample_counts": {"s2": 5},
+                "representative_quality": [40] * 8,
+            },
+        }
+        fast_model = BatchCountingFastModel()
+        full_model = BatchCountingFullModel()
+
+        rows = greedy_cluster(
+            global_table=global_table,
+            metric_cache=compute_sequence_metrics_cache(global_table),
+            fast_model=fast_model,
+            full_model=full_model,
+            fast_features=["length_diff"],
+            full_features=["length_diff"],
+            fast_threshold=0.5,
+            percent_identity=97.0,
+        )
+
+        by_id = {row["sequence_id"]: row for row in rows}
+        self.assertEqual(by_id["id_c"]["otu_id"], by_id["id_b"]["otu_id"])
+        # id_a becomes centroid immediately; id_b compares against one centroid; id_c against two.
+        self.assertEqual(fast_model.batch_sizes, [1, 2])
+        self.assertEqual(full_model.batch_sizes, [1, 2])
 
     def test_selected_features_fallbacks(self):
         model = MockModelWithFeatures()

@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 
 from apply_clustering import (
+    _reverse_complement,
+    trim_read_with_primers,
     build_otu_table,
     discover_fastq_files,
     dereplicate_fastq_files,
@@ -206,6 +208,100 @@ class TestApplyClustering(unittest.TestCase):
             self.assertEqual(otu_df.loc[0, "otu_id"], "OTU_1")
             self.assertEqual(int(otu_df.loc[0, "sample1"]), 2)
             self.assertEqual(int(otu_df.loc[0, "sample2"]), 1)
+
+
+class TestPrimerTrimming(unittest.TestCase):
+    def test_reverse_complement(self):
+        self.assertEqual(_reverse_complement("ATGC"), "GCAT")
+        self.assertEqual(_reverse_complement("AAAA"), "TTTT")
+        self.assertEqual(_reverse_complement("ACGT"), "ACGT")
+
+    def test_trim_no_primers(self):
+        seq = "ACGTACGT"
+        quality = [30, 30, 30, 30, 30, 30, 30, 30]
+        trimmed_s, trimmed_q = trim_read_with_primers(seq, quality, None, None)
+        self.assertEqual(trimmed_s, seq)
+        self.assertEqual(trimmed_q, quality)
+
+    def test_trim_both_primers_forward(self):
+        # Sequence: AAA [insert] TTT where AAA=primer5, TTT=primer3
+        seq = "AAACCCGTTTTT"
+        quality = list(range(len(seq)))
+        p5 = "AAA"
+        p3 = "TTT"
+        trimmed_s, trimmed_q = trim_read_with_primers(seq, quality, p5, p3)
+        # After trimming: "CCCG" (between primer5 end and primer3 start)
+        self.assertEqual(trimmed_s, "CCCG")
+        # Quality should align with the trimmed region
+        self.assertEqual(trimmed_q, quality[3:7])
+        self.assertEqual(len(trimmed_s), len(trimmed_q))
+
+    def test_trim_only_primer5(self):
+        seq = "AAACCCGGG"
+        quality = list(range(len(seq)))
+        trimmed_s, trimmed_q = trim_read_with_primers(seq, quality, "AAA", None)
+        self.assertEqual(trimmed_s, "CCCGGG")
+        self.assertEqual(trimmed_q, quality[3:])
+        self.assertEqual(len(trimmed_s), len(trimmed_q))
+
+    def test_trim_only_primer3(self):
+        seq = "CCCGGGTTT"
+        quality = list(range(len(seq)))
+        trimmed_s, trimmed_q = trim_read_with_primers(seq, quality, None, "TTT")
+        self.assertEqual(trimmed_s, "CCCGGG")
+        self.assertEqual(trimmed_q, quality[:6])
+        self.assertEqual(len(trimmed_s), len(trimmed_q))
+
+    def test_trim_not_found_returns_original(self):
+        # Primers not present — relaxed: return unchanged
+        seq = "GGGGGGGG"
+        quality = [20] * len(seq)
+        trimmed_s, trimmed_q = trim_read_with_primers(seq, quality, "AAA", "TTT")
+        self.assertEqual(trimmed_s, seq)
+        self.assertEqual(trimmed_q, quality)
+
+    def test_trim_reverse_complement_orientation(self):
+        # Build a read that comes from the reverse strand:
+        #   read = RC(primer5) + RC(insert) + RC(primer3)
+        # Taking the RC of this read gives: primer3 + insert + primer5.
+        # Use primers that don't appear in their own RC to ensure the forward
+        # pass fails and the RC pass is exercised.
+        p5 = "AACC"   # RC(p5) = "GGTT"
+        p3 = "TTGG"   # RC(p3) = "CCAA"
+        insert = "GCGC"
+        reverse_strand_read = _reverse_complement(p5) + _reverse_complement(insert) + _reverse_complement(p3)
+        # = "GGTT" + "GCGC" + "CCAA" = "GGTTGCGCCCAA"
+        quality = list(range(len(reverse_strand_read)))
+
+        trimmed_s, trimmed_q = trim_read_with_primers(
+            reverse_strand_read, quality, p5, p3
+        )
+        self.assertEqual(trimmed_s, insert)
+        self.assertEqual(len(trimmed_s), len(trimmed_q))
+
+    def test_dereplication_with_primer_trimming(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Reads: primer5 + insert + primer3
+            # After trimming, inserts should be dereplicated together
+            p1 = os.path.join(tmpdir, "sample1.fastq")
+            p5 = "AAA"
+            p3 = "TTT"
+            with open(p1, "w", encoding="utf-8") as fh:
+                # Two reads with same insert "CCCC" but different flanking primers
+                for rec_seq in ["AAACCCCTTTT", "AAACCCCTTTT", "AAAGGGGTTTT"]:
+                    qual_str = "I" * len(rec_seq)
+                    fh.write(f"@r\n{rec_seq}\n+\n{qual_str}\n")
+
+            files = [p1]
+            sample_names, table = dereplicate_fastq_files(files, primer5=p5, primer3=p3)
+            # "AAACCCCTTTT" → trimmed to "CCCC" (2 copies)
+            # "AAAGGGGTTTT" → trimmed to "GGGG" (1 copy)
+            self.assertIn("CCCC", table)
+            self.assertIn("GGGG", table)
+            self.assertEqual(table["CCCC"]["total_abundance"], 2)
+            self.assertEqual(table["GGGG"]["total_abundance"], 1)
+            # Quality should be aligned: 4 scores for 4-base insert
+            self.assertEqual(len(table["CCCC"]["representative_quality"]), 4)
 
 
 if __name__ == "__main__":

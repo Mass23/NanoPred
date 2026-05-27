@@ -19,6 +19,79 @@ from train_model import _get_classifier_scores, expand_features
 SUPPORTED_FASTQ_EXTENSIONS = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
 
 
+def _reverse_complement(seq: str) -> str:
+    """Return the reverse complement of a DNA sequence."""
+    complement = str.maketrans("ACGTacgt", "TGCAtgca")
+    return seq.translate(complement)[::-1]
+
+
+def trim_read_with_primers(
+    seq: str,
+    quality: List[int],
+    primer5: Optional[str],
+    primer3: Optional[str],
+) -> Tuple[str, List[int]]:
+    """Trim primer sequences from a read, keeping quality scores aligned.
+
+    Tries forward orientation first, then reverse-complement.  If neither
+    primer is found the read is returned unchanged (relaxed/tolerant behaviour
+    suited to low-quality Nanopore data).
+
+    Args:
+        seq:     DNA sequence string.
+        quality: Phred quality scores, one per base (same length as seq).
+        primer5: 5' primer sequence to trim (or None to skip).
+        primer3: 3' primer sequence to trim (or None to skip).
+
+    Returns:
+        (trimmed_seq, trimmed_quality) tuple with matching lengths.
+    """
+    if not primer5 and not primer3:
+        return seq, quality
+
+    def _find_and_trim(s: str, q: List[int], p5: Optional[str], p3: Optional[str]):
+        s_upper = s.upper()
+        start = 0
+        end = len(s_upper)
+        found = False
+
+        if p5:
+            idx = s_upper.find(p5.upper())
+            if idx != -1:
+                start = idx + len(p5)
+                found = True
+
+        if p3:
+            idx = s_upper.find(p3.upper(), start)
+            if idx != -1:
+                end = idx
+                found = True
+
+        if not found:
+            return None, None
+
+        trimmed_s = s[start:end]
+        trimmed_q = list(q[start:end]) if q else []
+        if not trimmed_s:
+            return None, None
+        return trimmed_s, trimmed_q
+
+    # Forward pass
+    trimmed_s, trimmed_q = _find_and_trim(seq, quality, primer5, primer3)
+    if trimmed_s is not None:
+        return trimmed_s, trimmed_q
+
+    # Reverse-complement pass: swap primer orientation
+    rc_seq = _reverse_complement(seq)
+    rc_quality = list(reversed(quality)) if quality else []
+    trimmed_s, trimmed_q = _find_and_trim(rc_seq, rc_quality, primer3, primer5)
+    if trimmed_s is not None:
+        return trimmed_s, trimmed_q
+
+    # Primers not found in either orientation — return unchanged (relaxed)
+    return seq, quality
+
+
 def discover_fastq_files(input_dir: str) -> List[str]:
     if not os.path.isdir(input_dir):
         raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
@@ -42,11 +115,17 @@ def _open_fastq(path: str):
     return open(path, "r", encoding="utf-8")
 
 
-def _iter_fastq_records(path: str):
+def _iter_fastq_records(
+    path: str,
+    primer5: Optional[str] = None,
+    primer3: Optional[str] = None,
+):
     with _open_fastq(path) as handle:
         for record in SeqIO.parse(handle, "fastq"):
             seq = rna_to_dna(str(record.seq))
             quality = record.letter_annotations.get("phred_quality", [])
+            if primer5 or primer3:
+                seq, quality = trim_read_with_primers(seq, quality, primer5, primer3)
             yield seq, quality
 
 
@@ -54,7 +133,11 @@ def _quality_mean(scores: Sequence[int]) -> float:
     return float(sum(scores)) / len(scores) if scores else 0.0
 
 
-def dereplicate_fastq_files(fastq_files: Sequence[str]) -> Tuple[List[str], Dict[str, dict]]:
+def dereplicate_fastq_files(
+    fastq_files: Sequence[str],
+    primer5: Optional[str] = None,
+    primer3: Optional[str] = None,
+) -> Tuple[List[str], Dict[str, dict]]:
     sample_names: List[str] = []
     global_table: Dict[str, dict] = {}
 
@@ -63,7 +146,7 @@ def dereplicate_fastq_files(fastq_files: Sequence[str]) -> Tuple[List[str], Dict
         sample_names.append(sample_name)
         sample_table: Dict[str, dict] = {}
 
-        for seq, quality in _iter_fastq_records(path):
+        for seq, quality in _iter_fastq_records(path, primer5=primer5, primer3=primer3):
             q_mean = _quality_mean(quality)
             row = sample_table.get(seq)
             if row is None:
@@ -311,6 +394,16 @@ def parse_args() -> argparse.Namespace:
         help="Assignment threshold for full-model predicted percent identity.",
     )
     parser.add_argument("--verbose", action="store_true", help="Print progress details.")
+    parser.add_argument(
+        "--primer5",
+        default=None,
+        help="5' primer sequence for trimming before dereplication (optional).",
+    )
+    parser.add_argument(
+        "--primer3",
+        default=None,
+        help="3' primer sequence for trimming before dereplication (optional).",
+    )
     return parser.parse_args()
 
 
@@ -323,12 +416,18 @@ def main() -> None:
     fast_threshold = resolve_fast_threshold(fast_model, fast_meta)
 
     fastq_files = discover_fastq_files(args.input_dir)
-    sample_names, global_table = dereplicate_fastq_files(fastq_files)
+    sample_names, global_table = dereplicate_fastq_files(
+        fastq_files,
+        primer5=args.primer5,
+        primer3=args.primer3,
+    )
 
     if args.verbose:
         print(f"Loaded {len(fastq_files)} FASTQ file(s):")
         for path in fastq_files:
             print(f"  - {path}")
+        if args.primer5 or args.primer3:
+            print(f"Primer trimming enabled: primer5={args.primer5!r}, primer3={args.primer3!r}")
         print(f"Global dereplicated sequences: {len(global_table)}")
         print(f"Using fast-model threshold: {fast_threshold:.6f}")
 

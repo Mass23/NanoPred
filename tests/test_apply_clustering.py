@@ -179,6 +179,7 @@ class TestApplyClustering(unittest.TestCase):
         )
 
         by_id = {row["sequence_id"]: row for row in rows}
+        self.assertTrue(by_id["id_b"]["is_centroid"])
         self.assertEqual(by_id["id_c"]["otu_id"], by_id["id_b"]["otu_id"])
         # id_a becomes centroid immediately; id_b compares against one centroid; id_c against two.
         self.assertEqual(fast_model.batch_sizes, [1, 2])

@@ -16,7 +16,7 @@ from src.data_creation import compute_metrics, compute_pair_features, rna_to_dna
 from train_model import _get_classifier_scores, expand_features
 
 
-FASTQ_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
+SUPPORTED_FASTQ_EXTENSIONS = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
 
 
 def discover_fastq_files(input_dir: str) -> List[str]:
@@ -26,12 +26,12 @@ def discover_fastq_files(input_dir: str) -> List[str]:
     files: List[str] = []
     for name in sorted(os.listdir(input_dir)):
         full_path = os.path.join(input_dir, name)
-        if os.path.isfile(full_path) and name.lower().endswith(FASTQ_SUFFIXES):
+        if os.path.isfile(full_path) and name.lower().endswith(SUPPORTED_FASTQ_EXTENSIONS):
             files.append(full_path)
 
     if not files:
         raise ValueError(
-            f"No FASTQ files found in {input_dir}. Expected extensions: {', '.join(FASTQ_SUFFIXES)}"
+            f"No FASTQ files found in {input_dir}. Expected extensions: {', '.join(SUPPORTED_FASTQ_EXTENSIONS)}"
         )
     return files
 
@@ -96,7 +96,7 @@ def dereplicate_fastq_files(fastq_files: Sequence[str]) -> Tuple[List[str], Dict
                     global_row["representative_quality_mean"] = float(sample_row["quality_mean"])
 
     for seq, row in global_table.items():
-        row["sequence_id"] = hashlib.sha1(seq.encode("utf-8")).hexdigest()[:16]
+        row["sequence_id"] = hashlib.sha256(seq.encode("utf-8")).hexdigest()
 
     return sample_names, global_table
 
@@ -150,9 +150,11 @@ def build_model_input(pair_features: dict, selected_features: Sequence[str]) -> 
     expanded = expand_features(base)
     missing = [feature for feature in selected_features if feature not in expanded.columns]
     if missing:
+        suffix = f" (showing first 10 of {len(missing)} total)" if len(missing) > 10 else ""
+        shown = ", ".join(missing[:10])
+        available = ", ".join(expanded.columns.tolist())
         raise ValueError(
-            "Missing expected model features after expansion: "
-            f"{', '.join(missing[:10])}"
+            f"Missing expected model features after expansion: {shown}{suffix}. Available features: {available}"
         )
     return expanded[list(selected_features)]
 
@@ -264,7 +266,7 @@ def write_output(rows: Sequence[dict], sample_names: Sequence[str], output_path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Greedy OTU-style clustering with NanoPred fast/full models."
+        description="Greedy OTU clustering with NanoPred fast/full models."
     )
     parser.add_argument("--model-dir", required=True, help="Directory containing model artifacts.")
     parser.add_argument("--input-dir", required=True, help="Directory containing FASTQ files.")

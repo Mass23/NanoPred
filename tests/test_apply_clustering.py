@@ -13,20 +13,20 @@ from apply_clustering import (
 )
 
 
-class DummyFastModel:
+class MockFastModel:
     def predict_proba(self, X):
-        vals = (X["length_diff"].to_numpy() <= 1.0).astype(float)
-        probs = np.where(vals > 0, 0.9, 0.1)
+        match = X["length_diff"].to_numpy() <= 1.0
+        probs = np.where(match, 0.9, 0.1)
         return np.vstack([1.0 - probs, probs]).T
 
 
-class DummyFullModel:
+class MockFullModel:
     def predict(self, X):
         vals = X["length_diff"].to_numpy()
         return np.where(vals <= 1.0, 98.0, 80.0)
 
 
-class ModelWithFeatureNames:
+class MockModelWithFeatures:
     feature_names_in_ = np.array(["length_diff"])
 
 
@@ -85,8 +85,8 @@ class TestApplyClustering(unittest.TestCase):
 
         rows = greedy_cluster(
             global_table=global_table,
-            fast_model=DummyFastModel(),
-            full_model=DummyFullModel(),
+            fast_model=MockFastModel(),
+            full_model=MockFullModel(),
             fast_features=["length_diff"],
             full_features=["length_diff"],
             fast_threshold=0.5,
@@ -101,7 +101,7 @@ class TestApplyClustering(unittest.TestCase):
         self.assertNotEqual(by_id["id_c"]["otu_id"], by_id["id_a"]["otu_id"])
 
     def test_selected_features_fallbacks(self):
-        model = ModelWithFeatureNames()
+        model = MockModelWithFeatures()
         self.assertEqual(
             resolve_selected_features(model, {"selected_features": ["length_diff"]}, "fast"),
             ["length_diff"],

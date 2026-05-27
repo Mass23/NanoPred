@@ -215,6 +215,9 @@ class TestPrimerTrimming(unittest.TestCase):
         self.assertEqual(_reverse_complement("ATGC"), "GCAT")
         self.assertEqual(_reverse_complement("AAAA"), "TTTT")
         self.assertEqual(_reverse_complement("ACGT"), "ACGT")
+        # Mixed case: complement preserves case mapping
+        self.assertEqual(_reverse_complement("atgc"), "gcat")
+        self.assertEqual(_reverse_complement("AtGc"), "gCaT")
 
     def test_trim_no_primers(self):
         seq = "ACGTACGT"

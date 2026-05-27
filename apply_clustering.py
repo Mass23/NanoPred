@@ -71,7 +71,7 @@ def trim_read_with_primers(
             return None, None
 
         trimmed_s = s[start:end]
-        trimmed_q = list(q[start:end]) if q else []
+        trimmed_q = list(q[start:end])
         if not trimmed_s:
             return None, None
         return trimmed_s, trimmed_q
@@ -83,7 +83,7 @@ def trim_read_with_primers(
 
     # Reverse-complement pass: swap primer orientation
     rc_seq = _reverse_complement(seq)
-    rc_quality = list(reversed(quality)) if quality else []
+    rc_quality = list(reversed(quality))
     trimmed_s, trimmed_q = _find_and_trim(rc_seq, rc_quality, primer3, primer5)
     if trimmed_s is not None:
         return trimmed_s, trimmed_q

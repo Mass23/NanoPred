@@ -4,66 +4,46 @@ import tempfile
 from Bio import SeqIO
 
 
-def _trim_record_forward(record, primer5, primer3, fmt):
-    """Trim a single SeqRecord using simple substring matching (forward direction only).
+def _run_cutadapt(input_path, output_path, primer5, primer3):
+    """Trim primers from a Nanopore FASTQ/FASTA file using cutadapt.
 
-    For Nanopore reads, which are always in the forward orientation:
-    - primer5 (forward primer) is trimmed from the 5' end of the read.
-    - primer3 (reverse primer) is trimmed from the 3' end of the read.
+    For Nanopore single-end reads:
+    - ``-g`` trims the forward primer from the 5' end.
+    - ``-a`` trims the reverse primer from the 3' end.
+
+    Reads where a primer is not found are kept unchanged (no
+    ``--discard-untrimmed``). Error tolerance is set to 20 % to handle
+    Nanopore's high base-error rate.
+
+    Args:
+        input_path:  Path to the input FASTA/FASTQ file.
+        output_path: Path for the trimmed output file.
+        primer5:     Forward primer sequence (or None/empty to skip 5' trimming).
+        primer3:     Reverse primer sequence (or None/empty to skip 3' trimming).
+
+    Raises:
+        RuntimeError: If cutadapt is not installed or exits with an error.
     """
-    seq = str(record.seq).upper()
-    p5 = primer5.upper() if primer5 else ''
-    p3 = primer3.upper() if primer3 else ''
+    cmd = ["cutadapt"]
+    if primer5:
+        cmd.extend(["-g", primer5])
+    if primer3:
+        cmd.extend(["-a", primer3])
+    cmd.extend(["-e", "0.2", "-o", output_path, input_path])
 
-    start = 0
-    end = len(seq)
-
-    if p5:
-        idx = seq.find(p5)
-        if idx != -1:
-            start = idx + len(p5)
-
-    if p3:
-        idx = seq.find(p3, start)
-        if idx != -1:
-            end = idx
-
-    if start >= end:
-        return None
-
-    return record[start:end]
-
-
-def _run_cutprimers(input_path, output_path, primer5, primer3, fmt):
-    """Run cutPrimers (forward pass only) and return the path to trimmed sequences.
-
-    Falls back to simple substring-based trimming if cutPrimers is not available.
-    Returns the path to the trimmed output file.
-    """
     try:
-        cmd = [
-            'cutPrimers',
-            '--reads', input_path,
-            '--primer5', primer5 or '',
-            '--primer3', primer3 or '',
-            '--output', output_path,
-            '--outputDiscarded', '/dev/null',
-        ]
-        result = subprocess.run(cmd, capture_output=True, timeout=60)
-        if result.returncode == 0 and os.path.exists(output_path):
-            return output_path
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+        result = subprocess.run(cmd, capture_output=True)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "cutadapt is not installed or not on PATH. "
+            "Install it with: pip install cutadapt"
+        )
 
-    # Fallback: simple substring trimming (forward direction only)
-    records = list(SeqIO.parse(input_path, fmt))
-    trimmed = []
-    for rec in records:
-        new_rec = _trim_record_forward(rec, primer5, primer3, fmt)
-        if new_rec is not None:
-            trimmed.append(new_rec)
-    SeqIO.write(trimmed, output_path, fmt)
-    return output_path
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"cutadapt failed (exit {result.returncode}):\n"
+            f"{result.stderr.decode(errors='replace')}"
+        )
 
 
 def trim_primers_fasta(input_fasta, output_fasta, primer5, primer3=None):
@@ -84,7 +64,7 @@ def trim_primers_fasta(input_fasta, output_fasta, primer5, primer3=None):
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         trimmed_path = os.path.join(tmpdir, "trimmed.fasta")
-        _run_cutprimers(input_fasta, trimmed_path, primer5, primer3, fmt="fasta")
+        _run_cutadapt(input_fasta, trimmed_path, primer5, primer3)
         trimmed_records = list(SeqIO.parse(trimmed_path, "fasta"))
 
         if output_fasta:
@@ -110,7 +90,7 @@ def trim_primers_fastq(input_fastq, output_fastq, primer5, primer3=None):
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         trimmed_path = os.path.join(tmpdir, "trimmed.fastq")
-        _run_cutprimers(input_fastq, trimmed_path, primer5, primer3, fmt="fastq")
+        _run_cutadapt(input_fastq, trimmed_path, primer5, primer3)
         trimmed_records = list(SeqIO.parse(trimmed_path, "fastq"))
 
         if output_fastq:

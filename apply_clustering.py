@@ -6,6 +6,8 @@ import gzip
 import hashlib
 import json
 import os
+import subprocess
+import tempfile
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import joblib
@@ -19,77 +21,56 @@ from train_model import _get_classifier_scores, expand_features
 SUPPORTED_FASTQ_EXTENSIONS = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
 
 
-def _reverse_complement(seq: str) -> str:
-    """Return the reverse complement of a DNA sequence."""
-    complement = str.maketrans("ACGTacgt", "TGCAtgca")
-    return seq.translate(complement)[::-1]
-
-
-def trim_read_with_primers(
-    seq: str,
-    quality: List[int],
+def _run_cutadapt(
+    input_path: str,
+    output_path: str,
     primer5: Optional[str],
     primer3: Optional[str],
-) -> Tuple[str, List[int]]:
-    """Trim primer sequences from a read, keeping quality scores aligned.
+) -> str:
+    """Trim primers from a FASTQ file using cutadapt.
 
-    Tries forward orientation first, then reverse-complement.  If neither
-    primer is found the read is returned unchanged (relaxed/tolerant behaviour
-    suited to low-quality Nanopore data).
+    Uses relaxed settings suitable for Nanopore reads (high error rate, Q10
+    quality): 20 % error tolerance and RC-strand detection.  Reads where no
+    primer is found are kept unchanged rather than discarded.
 
     Args:
-        seq:     DNA sequence string.
-        quality: Phred quality scores, one per base (same length as seq).
-        primer5: 5' primer sequence to trim (or None to skip).
-        primer3: 3' primer sequence to trim (or None to skip).
+        input_path:  Path to the input FASTQ (plain or gzip).
+        output_path: Path for the trimmed output FASTQ.
+        primer5:     5' primer sequence (or None to skip).
+        primer3:     3' primer sequence (or None to skip).
 
     Returns:
-        (trimmed_seq, trimmed_quality) tuple with matching lengths.
+        *output_path* on success.
+
+    Raises:
+        RuntimeError: If cutadapt is not installed or exits with an error.
     """
-    if not primer5 and not primer3:
-        return seq, quality
+    cmd = ["cutadapt"]
+    if primer5:
+        cmd.extend(["-g", primer5])
+    if primer3:
+        cmd.extend(["-a", primer3])
+    # --rc: also search the reverse complement of the adapter sequences so reads
+    #       from either strand of the amplicon are trimmed correctly.
+    # -e 0.2: allow up to 20 % mismatches — tolerant for Nanopore error rates.
+    # Default cutadapt behaviour keeps untrimmed reads, which is the relaxed
+    # policy we want (never discard a read just because primers are absent).
+    cmd.extend(["--rc", "-e", "0.2", "-o", output_path, input_path])
 
-    def _find_and_trim(s: str, q: List[int], p5: Optional[str], p3: Optional[str]):
-        s_upper = s.upper()
-        start = 0
-        end = len(s_upper)
-        found = False
+    try:
+        result = subprocess.run(cmd, capture_output=True)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "cutadapt is not installed or not on PATH. "
+            "Install it with: pip install cutadapt"
+        )
 
-        if p5:
-            idx = s_upper.find(p5.upper())
-            if idx != -1:
-                start = idx + len(p5)
-                found = True
-
-        if p3:
-            idx = s_upper.find(p3.upper(), start)
-            if idx != -1:
-                end = idx
-                found = True
-
-        if not found:
-            return None, None
-
-        trimmed_s = s[start:end]
-        trimmed_q = list(q[start:end])
-        if not trimmed_s:
-            return None, None
-        return trimmed_s, trimmed_q
-
-    # Forward pass
-    trimmed_s, trimmed_q = _find_and_trim(seq, quality, primer5, primer3)
-    if trimmed_s is not None:
-        return trimmed_s, trimmed_q
-
-    # Reverse-complement pass: swap primer orientation
-    rc_seq = _reverse_complement(seq)
-    rc_quality = list(reversed(quality))
-    trimmed_s, trimmed_q = _find_and_trim(rc_seq, rc_quality, primer3, primer5)
-    if trimmed_s is not None:
-        return trimmed_s, trimmed_q
-
-    # Primers not found in either orientation — return unchanged (relaxed)
-    return seq, quality
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"cutadapt failed (exit {result.returncode}):\n"
+            f"{result.stderr.decode(errors='replace')}"
+        )
+    return output_path
 
 
 def discover_fastq_files(input_dir: str) -> List[str]:
@@ -115,17 +96,11 @@ def _open_fastq(path: str):
     return open(path, "r", encoding="utf-8")
 
 
-def _iter_fastq_records(
-    path: str,
-    primer5: Optional[str] = None,
-    primer3: Optional[str] = None,
-):
+def _iter_fastq_records(path: str):
     with _open_fastq(path) as handle:
         for record in SeqIO.parse(handle, "fastq"):
             seq = rna_to_dna(str(record.seq))
             quality = record.letter_annotations.get("phred_quality", [])
-            if primer5 or primer3:
-                seq, quality = trim_read_with_primers(seq, quality, primer5, primer3)
             yield seq, quality
 
 
@@ -141,28 +116,36 @@ def dereplicate_fastq_files(
     sample_names: List[str] = []
     global_table: Dict[str, dict] = {}
 
-    for path in fastq_files:
-        sample_name = os.path.basename(path)
-        sample_names.append(sample_name)
-        sample_table: Dict[str, dict] = {}
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for path in fastq_files:
+            sample_name = os.path.basename(path)
+            sample_names.append(sample_name)
+            sample_table: Dict[str, dict] = {}
 
-        for seq, quality in _iter_fastq_records(path, primer5=primer5, primer3=primer3):
-            q_mean = _quality_mean(quality)
-            row = sample_table.get(seq)
-            if row is None:
-                sample_table[seq] = {
-                    "count": 1,
-                    "quality": list(quality),
-                    "quality_mean": q_mean,
-                }
+            if primer5 or primer3:
+                trimmed_path = os.path.join(tmpdir, sample_name + ".trimmed.fastq")
+                _run_cutadapt(path, trimmed_path, primer5, primer3)
+                read_path = trimmed_path
             else:
-                row["count"] += 1
-                if q_mean > row["quality_mean"]:
-                    row["quality"] = list(quality)
-                    row["quality_mean"] = q_mean
+                read_path = path
 
-        for seq, sample_row in sample_table.items():
-            global_row = global_table.get(seq)
+            for seq, quality in _iter_fastq_records(read_path):
+                q_mean = _quality_mean(quality)
+                row = sample_table.get(seq)
+                if row is None:
+                    sample_table[seq] = {
+                        "count": 1,
+                        "quality": list(quality),
+                        "quality_mean": q_mean,
+                    }
+                else:
+                    row["count"] += 1
+                    if q_mean > row["quality_mean"]:
+                        row["quality"] = list(quality)
+                        row["quality_mean"] = q_mean
+
+            for seq, sample_row in sample_table.items():
+                global_row = global_table.get(seq)
             if global_row is None:
                 global_table[seq] = {
                     "sequence": seq,

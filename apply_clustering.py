@@ -223,7 +223,7 @@ def greedy_cluster(
             continue
 
         centroids.append(sequence)
-        otu_id = f"OTU_{len(centroids):06d}"
+        otu_id = f"OTU_{len(centroids)}"
         centroid_to_otu[sequence] = otu_id
         clustered_rows.append(
             {
@@ -242,7 +242,7 @@ def greedy_cluster(
     return clustered_rows
 
 
-def write_output(rows: Sequence[dict], sample_names: Sequence[str], output_path: str) -> None:
+def build_assignment_table(rows: Sequence[dict], sample_names: Sequence[str]) -> pd.DataFrame:
     out_rows = []
     for row in rows:
         base = {
@@ -252,16 +252,49 @@ def write_output(rows: Sequence[dict], sample_names: Sequence[str], output_path:
             "centroid_sequence_id": row["centroid_sequence_id"],
             "predicted_percent_identity": row["predicted_percent_identity"],
             "assignment_type": row["assignment_type"],
+            "assignment_status": "new_centroid" if row["is_centroid"] else "assigned_to_existing_otu",
             "is_centroid": row["is_centroid"],
             "total_abundance": row["total_abundance"],
+            "sample_counts": json.dumps(
+                {sample_name: int(row["sample_counts"].get(sample_name, 0)) for sample_name in sample_names},
+                sort_keys=True,
+            ),
         }
         for sample_name in sample_names:
             base[f"count_{sample_name}"] = int(row["sample_counts"].get(sample_name, 0))
         out_rows.append(base)
 
-    df = pd.DataFrame(out_rows)
-    sep = "\t" if output_path.lower().endswith(".tsv") else ","
-    df.to_csv(output_path, sep=sep, index=False)
+    return pd.DataFrame(out_rows)
+
+
+def build_otu_table(rows: Sequence[dict], sample_names: Sequence[str]) -> pd.DataFrame:
+    otu_order: List[str] = []
+    otu_counts: Dict[str, Dict[str, int]] = {}
+
+    for row in rows:
+        otu_id = row["otu_id"]
+        if otu_id not in otu_counts:
+            otu_order.append(otu_id)
+            otu_counts[otu_id] = {sample_name: 0 for sample_name in sample_names}
+        for sample_name in sample_names:
+            otu_counts[otu_id][sample_name] += int(row["sample_counts"].get(sample_name, 0))
+
+    otu_df = pd.DataFrame.from_dict(otu_counts, orient="index")
+    otu_df = otu_df.reindex(index=otu_order, columns=list(sample_names), fill_value=0)
+    otu_df.index.name = "otu_id"
+    return otu_df
+
+
+def write_output(rows: Sequence[dict], sample_names: Sequence[str], output_path: str) -> Tuple[str, str]:
+    assignments_path = output_path
+    otu_table_path = os.path.join(os.path.dirname(os.path.abspath(output_path)), "OTU_table.csv")
+
+    assignment_df = build_assignment_table(rows, sample_names)
+    assignment_df.to_csv(assignments_path, sep="\t", index=False)
+
+    otu_df = build_otu_table(rows, sample_names)
+    otu_df.to_csv(otu_table_path)
+    return assignments_path, otu_table_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -308,11 +341,12 @@ def main() -> None:
         fast_threshold=fast_threshold,
         percent_identity=float(args.percent_identity),
     )
-    write_output(clustered_rows, sample_names, args.output)
+    assignments_path, otu_table_path = write_output(clustered_rows, sample_names, args.output)
 
     if args.verbose:
         n_centroids = sum(1 for row in clustered_rows if row["is_centroid"])
-        print(f"Clusters written to: {args.output}")
+        print(f"Cluster assignments written to: {assignments_path}")
+        print(f"OTU table written to: {otu_table_path}")
         print(f"Total unique sequences: {len(clustered_rows)}")
         print(f"Centroids/OTUs: {n_centroids}")
 

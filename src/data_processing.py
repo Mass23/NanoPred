@@ -1,80 +1,112 @@
-def trim_primers_bidirectional_fasta(input_fasta, output_fasta, primer5, primer3=None):
-    """
-    Trim with cutPrimers. If primers not found, reverse-complement sequence and swap primer sides.
-    Returns: list of all successfully trimmed SeqRecords (FASTA mode).
-    """
-    from Bio import SeqIO
-    import tempfile
+import os
+import subprocess
+import tempfile
+from Bio import SeqIO
 
+
+def _run_cutadapt(input_path, output_path, primer5, primer3):
+    """Trim primers from a Nanopore FASTQ/FASTA file using cutadapt.
+
+    For Nanopore single-end reads:
+    - ``-g`` trims the forward primer from the 5' end.
+    - ``-a`` trims the reverse primer from the 3' end.
+
+    Reads where a primer is not found are kept unchanged (no
+    ``--discard-untrimmed``). Error tolerance is set to 20 % to handle
+    Nanopore's high base-error rate.
+
+    Args:
+        input_path:  Path to the input FASTA/FASTQ file.
+        output_path: Path for the trimmed output file.
+        primer5:     Forward primer sequence (or None/empty to skip 5' trimming).
+        primer3:     Reverse primer sequence (or None/empty to skip 3' trimming).
+
+    Raises:
+        RuntimeError: If cutadapt is not installed or exits with an error.
+    """
+    cmd = ["cutadapt"]
+    if primer5:
+        cmd.extend(["-g", primer5])
+    if primer3:
+        cmd.extend(["-a", primer3])
+    cmd.extend(["-e", "0.2", "-o", output_path, input_path])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "cutadapt is not installed or not on PATH. "
+            "Install it with: pip install cutadapt"
+        )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"cutadapt failed (exit {result.returncode}):\n"
+            f"{result.stderr.decode(errors='replace')}"
+        )
+
+
+def trim_primers_fasta(input_fasta, output_fasta, primer5, primer3=None):
+    """Trim primers from Nanopore FASTA reads (forward direction only).
+
+    Nanopore reads are always in the forward orientation, so no
+    reverse-complement pass is performed. Both primer5 (forward primer) and
+    primer3 (reverse primer) are used to cut the read from each end.
+
+    Args:
+        input_fasta:  Path to input FASTA file.
+        output_fasta: Path to write trimmed FASTA records (optional).
+        primer5:      Forward primer sequence to trim from the 5' end.
+        primer3:      Reverse primer sequence to trim from the 3' end (optional).
+
+    Returns:
+        List of trimmed SeqRecord objects.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
-        # 1st pass: as-is
         trimmed_path = os.path.join(tmpdir, "trimmed.fasta")
-        utr_path = os.path.join(tmpdir, "untrimmed.fasta")
-        t_path, u_path = run_cutprimers(input_fasta, trimmed_path, primer5, primer3, fmt="fasta")
-        trimmed_records = list(SeqIO.parse(t_path, "fasta"))
-        untrimmed_records = list(SeqIO.parse(u_path, "fasta")) if os.path.exists(u_path) else []
+        _run_cutadapt(input_fasta, trimmed_path, primer5, primer3)
+        trimmed_records = list(SeqIO.parse(trimmed_path, "fasta"))
 
-        if not untrimmed_records:
-            return trimmed_records
-
-        # 2nd pass: reverse-complement untrimmed, swap primer orientation
-        rc_untrimmed_path = os.path.join(tmpdir, "untrimmed_rc.fasta")
-        rc_records = reverse_complement_records(untrimmed_records)
-        write_seqs(rc_records, rc_untrimmed_path, "fasta")
-        rc_trimmed_path = os.path.join(tmpdir, "trimmed_rc.fasta")
-
-        # Now: primer at 5' is original primer3, and at 3' is original primer5
-        t2_path, _ = run_cutprimers(
-            rc_untrimmed_path,
-            rc_trimmed_path,
-            primer3 if primer3 else "",
-            primer5 if primer5 else "",
-            fmt="fasta"
-        )
-        trimmed_rc_records = list(SeqIO.parse(t2_path, "fasta")) if os.path.exists(t2_path) else []
-
-        # Combine both sets of trimmed records
-        out_records = trimmed_records + trimmed_rc_records
-        # Optionally: write to output_fasta
         if output_fasta:
-            write_seqs(out_records, output_fasta, "fasta")
-        return out_records
+            SeqIO.write(trimmed_records, output_fasta, "fasta")
+        return trimmed_records
 
-def trim_primers_bidirectional_fastq(input_fastq, output_fastq, primer5, primer3=None):
-    """
-    Same logic as above, but works with FASTQ.
-    """
-    from Bio import SeqIO
-    import tempfile
 
+def trim_primers_fastq(input_fastq, output_fastq, primer5, primer3=None):
+    """Trim primers from Nanopore FASTQ reads (forward direction only).
+
+    Nanopore reads are always in the forward orientation, so no
+    reverse-complement pass is performed. Both primer5 (forward primer) and
+    primer3 (reverse primer) are used to cut the read from each end.
+
+    Args:
+        input_fastq:  Path to input FASTQ file.
+        output_fastq: Path to write trimmed FASTQ records (optional).
+        primer5:      Forward primer sequence to trim from the 5' end.
+        primer3:      Reverse primer sequence to trim from the 3' end (optional).
+
+    Returns:
+        List of trimmed SeqRecord objects.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
-        # 1st pass: as-is
         trimmed_path = os.path.join(tmpdir, "trimmed.fastq")
-        utr_path = os.path.join(tmpdir, "untrimmed.fastq")
-        t_path, u_path = run_cutprimers(input_fastq, trimmed_path, primer5, primer3, fmt="fastq")
-        trimmed_records = list(SeqIO.parse(t_path, "fastq"))
-        untrimmed_records = list(SeqIO.parse(u_path, "fastq")) if os.path.exists(u_path) else []
+        _run_cutadapt(input_fastq, trimmed_path, primer5, primer3)
+        trimmed_records = list(SeqIO.parse(trimmed_path, "fastq"))
 
-        if not untrimmed_records:
-            return trimmed_records
-
-        # 2nd pass: reverse-complement untrimmed, swap primer orientation
-        rc_untrimmed_path = os.path.join(tmpdir, "untrimmed_rc.fastq")
-        rc_records = reverse_complement_records(untrimmed_records)
-        write_seqs(rc_records, rc_untrimmed_path, "fastq")
-        rc_trimmed_path = os.path.join(tmpdir, "trimmed_rc.fastq")
-
-        # Now: primer at 5' is original primer3, and at 3' is original primer5
-        t2_path, _ = run_cutprimers(
-            rc_untrimmed_path,
-            rc_trimmed_path,
-            primer3 if primer3 else "",
-            primer5 if primer5 else "",
-            fmt="fastq"
-        )
-        trimmed_rc_records = list(SeqIO.parse(t2_path, "fastq")) if os.path.exists(t2_path) else []
-
-        out_records = trimmed_records + trimmed_rc_records
         if output_fastq:
-            write_seqs(out_records, output_fastq, "fastq")
-        return out_records
+            SeqIO.write(trimmed_records, output_fastq, "fastq")
+        return trimmed_records
+
+
+def process_fasta_for_benchmark(input_fasta, primer5, primer3):
+    """Trim primers from a FASTA file and return trimmed records (for benchmarking).
+
+    Args:
+        input_fasta: Path to input FASTA file.
+        primer5:     Forward primer sequence.
+        primer3:     Reverse primer sequence.
+
+    Returns:
+        List of trimmed SeqRecord objects.
+    """
+    return trim_primers_fasta(input_fasta, None, primer5, primer3)

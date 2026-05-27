@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import joblib
@@ -391,12 +392,26 @@ def precompute_sequence_metrics(
     verbose: bool = False,
 ) -> Dict[str, dict]:
     metric_cache: Dict[str, dict] = {}
-    iterator = rows
-    if verbose:
-        iterator = tqdm(rows, unit="seq", desc="Getting data from sequences")
-    for row in iterator:
+    if not verbose:
+        for row in rows:
+            sequence = row["sequence"]
+            metric_cache[sequence] = compute_metrics(sequence, row["representative_quality"])
+        return metric_cache
+
+    started = time.perf_counter()
+    bar = tqdm(
+        total=len(rows),
+        unit="seq",
+        desc="Getting data from sequences",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    )
+    for row in rows:
         sequence = row["sequence"]
         metric_cache[sequence] = compute_metrics(sequence, row["representative_quality"])
+        bar.update(1)
+    elapsed = time.perf_counter() - started
+    bar.set_postfix_str(f"elapsed={elapsed:.1f}s")
+    bar.close()
     return metric_cache
 
 
@@ -430,9 +445,7 @@ def get_full_data(
 
 
 def greedy_cluster(
-    rows: Optional[Sequence[dict]] = None,
     global_table: Dict[str, dict],
-    sequence_metrics: Optional[Dict[str, dict]] = None,
     fast_model,
     full_model,
     fast_features: Sequence[str],
@@ -440,6 +453,8 @@ def greedy_cluster(
     fast_threshold: float,
     percent_identity: float,
     min_clusters: int = 20,
+    rows: Optional[Sequence[dict]] = None,
+    sequence_metrics: Optional[Dict[str, dict]] = None,
 ) -> List[dict]:
     if rows is None:
         rows = sorted(

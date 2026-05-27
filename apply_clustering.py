@@ -8,7 +8,7 @@ import json
 import os
 import subprocess
 import tempfile
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import joblib
 import pandas as pd
@@ -127,6 +127,7 @@ def dereplicate_fastq_files(
     fastq_files: Sequence[Tuple[str, str]],
     primer5: Optional[str] = None,
     primer3: Optional[str] = None,
+    verbose: bool = False,
 ) -> Tuple[List[str], Dict[str, dict]]:
     """Dereplicate reads from single-end FASTQ files, optionally trimming primers.
 
@@ -144,6 +145,7 @@ def dereplicate_fastq_files(
             :func:`discover_fastq_files`.
         primer5: Forward primer for cutadapt 5' trimming (or ``None``).
         primer3: Reverse primer for cutadapt 3' trimming (or ``None``).
+        verbose: If ``True``, prints step labels for trimming and dereplication.
 
     Returns:
         A tuple ``(sample_names, global_table)`` where *sample_names* is the
@@ -154,6 +156,10 @@ def dereplicate_fastq_files(
     """
     sample_names: List[str] = []
     global_table: Dict[str, dict] = {}
+
+    if verbose:
+        print("Step 1: cutting primers")
+        print("Step 2: dereplication")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for path, sample_name in fastq_files:
@@ -251,8 +257,13 @@ def resolve_fast_threshold(fast_model, fast_metadata: Optional[dict]) -> float:
     return 0.5
 
 
-def build_model_input(pair_features: dict, selected_features: Sequence[str]) -> pd.DataFrame:
-    base = pd.DataFrame([pair_features])
+def build_model_input(
+    pair_features: Union[dict, pd.DataFrame], selected_features: Sequence[str]
+) -> pd.DataFrame:
+    if isinstance(pair_features, pd.DataFrame):
+        base = pair_features
+    else:
+        base = pd.DataFrame([pair_features])
     expanded = expand_features(base)
     missing = [feature for feature in selected_features if feature not in expanded.columns]
     if missing:
@@ -265,8 +276,17 @@ def build_model_input(pair_features: dict, selected_features: Sequence[str]) -> 
     return expanded[list(selected_features)]
 
 
+def compute_sequence_metrics_cache(global_table: Dict[str, dict]) -> Dict[str, dict]:
+    """Compute metrics once per dereplicated unique sequence."""
+    metric_cache: Dict[str, dict] = {}
+    for sequence, row in global_table.items():
+        metric_cache[sequence] = compute_metrics(sequence, row["representative_quality"])
+    return metric_cache
+
+
 def greedy_cluster(
     global_table: Dict[str, dict],
+    metric_cache: Dict[str, dict],
     fast_model,
     full_model,
     fast_features: Sequence[str],
@@ -279,53 +299,53 @@ def greedy_cluster(
         key=lambda row: (-int(row["total_abundance"]), row["sequence"]),
     )
 
-    metric_cache: Dict[str, dict] = {}
     centroids: List[str] = []
     centroid_to_otu: Dict[str, str] = {}
     clustered_rows: List[dict] = []
     otu_count = 0
 
-    with tqdm(total=len(rows), unit="seq", desc="Assigning OTUs") as pbar:
+    with tqdm(total=len(rows), unit="seq", desc="Step 4: OTU clustering (OTUs=0)") as pbar:
         for row in rows:
             sequence = row["sequence"]
-            if sequence not in metric_cache:
-                metric_cache[sequence] = compute_metrics(sequence, row["representative_quality"])
             candidate_metrics = metric_cache[sequence]
 
             assigned = False
-            for centroid_seq in centroids:
-                if centroid_seq not in metric_cache:
-                    centroid_row = global_table[centroid_seq]
-                    metric_cache[centroid_seq] = compute_metrics(
-                        centroid_seq,
-                        centroid_row["representative_quality"],
-                    )
-                centroid_metrics = metric_cache[centroid_seq]
+            if centroids:
+                pair_rows = [
+                    compute_pair_features(candidate_metrics, metric_cache[centroid_seq])
+                    for centroid_seq in centroids
+                ]
+                pair_df = pd.DataFrame(pair_rows)
+                X_fast = build_model_input(pair_df, fast_features)
+                fast_scores = _get_classifier_scores(fast_model, X_fast)
+                pass_idx = [
+                    idx for idx, score in enumerate(fast_scores) if float(score) >= fast_threshold
+                ]
 
-                pair_features = compute_pair_features(candidate_metrics, centroid_metrics)
-                X_fast = build_model_input(pair_features, fast_features)
-                fast_score = float(_get_classifier_scores(fast_model, X_fast)[0])
-                if fast_score < fast_threshold:
-                    continue
+                if pass_idx:
+                    full_pair_df = pair_df.iloc[pass_idx].reset_index(drop=True)
+                    X_full = build_model_input(full_pair_df, full_features)
+                    predicted_identities = full_model.predict(X_full)
 
-                X_full = build_model_input(pair_features, full_features)
-                predicted_identity = float(full_model.predict(X_full)[0])
-                if predicted_identity >= percent_identity:
-                    clustered_rows.append(
-                        {
-                            "sequence_id": row["sequence_id"],
-                            "sequence": sequence,
-                            "otu_id": centroid_to_otu[centroid_seq],
-                            "centroid_sequence_id": global_table[centroid_seq]["sequence_id"],
-                            "predicted_percent_identity": predicted_identity,
-                            "assignment_type": "fast+full",
-                            "is_centroid": False,
-                            "total_abundance": int(row["total_abundance"]),
-                            "sample_counts": row["sample_counts"],
-                        }
-                    )
-                    assigned = True
-                    break
+                    for centroid_idx, predicted_identity in zip(pass_idx, predicted_identities):
+                        if float(predicted_identity) < percent_identity:
+                            continue
+                        centroid_seq = centroids[centroid_idx]
+                        clustered_rows.append(
+                            {
+                                "sequence_id": row["sequence_id"],
+                                "sequence": sequence,
+                                "otu_id": centroid_to_otu[centroid_seq],
+                                "centroid_sequence_id": global_table[centroid_seq]["sequence_id"],
+                                "predicted_percent_identity": float(predicted_identity),
+                                "assignment_type": "fast+full",
+                                "is_centroid": False,
+                                "total_abundance": int(row["total_abundance"]),
+                                "sample_counts": row["sample_counts"],
+                            }
+                        )
+                        assigned = True
+                        break
 
             if not assigned:
                 centroids.append(sequence)
@@ -346,7 +366,7 @@ def greedy_cluster(
                     }
                 )
 
-            pbar.set_description(f"Assigning OTUs: {otu_count} OTUs")
+            pbar.set_description(f"Step 4: OTU clustering (OTUs={otu_count})")
             pbar.update(1)
 
     return clustered_rows
@@ -451,7 +471,11 @@ def main() -> None:
         fastq_files,
         primer5=args.primer5,
         primer3=args.primer3,
+        verbose=args.verbose,
     )
+    if args.verbose:
+        print("Step 3: getting data from sequences")
+    metric_cache = compute_sequence_metrics_cache(global_table)
 
     if args.verbose:
         print(f"Loaded {len(fastq_files)} FASTQ file(s):")
@@ -468,9 +492,11 @@ def main() -> None:
             print(f"Primer trimming enabled (cutadapt): {' '.join(primer_parts)}")
         print(f"Global dereplicated sequences: {len(global_table)}")
         print(f"Using fast-model threshold: {fast_threshold:.6f}")
+        print("Step 4: OTU clustering")
 
     clustered_rows = greedy_cluster(
         global_table=global_table,
+        metric_cache=metric_cache,
         fast_model=fast_model,
         full_model=full_model,
         fast_features=fast_features,

@@ -107,7 +107,7 @@ def discover_fastq_pairs(input_dir: str) -> List[Tuple[str, str, str]]:
         num_suffix = m.group(3) or ""  # e.g. "_001" or ""
         ext = m.group(4)           # e.g. ".fastq.gz"
 
-        r2_name = prefix + r1_suffix.upper().replace("R1", "R2") + num_suffix + ext
+        r2_name = prefix + r1_suffix.replace("1", "2") + num_suffix + ext
         r1_path = os.path.join(input_dir, name)
         r2_path = os.path.join(input_dir, r2_name)
 
@@ -223,6 +223,8 @@ def dereplicate_fastq_files(
                         global_row["representative_quality"] = list(sample_row["quality"])
                         global_row["representative_quality_mean"] = float(sample_row["quality_mean"])
 
+    # sequence_id is computed once after all samples are merged to avoid
+    # redundant SHA-256 work during the per-sample accumulation loop.
     for seq, row in global_table.items():
         row["sequence_id"] = hashlib.sha256(seq.encode("utf-8")).hexdigest()
 
@@ -472,10 +474,12 @@ def main() -> None:
         for r1, r2, sname in fastq_pairs:
             print(f"  - {sname}: {os.path.basename(r1)} / {os.path.basename(r2)}")
         if args.primer5 or args.primer3:
-            print(
-                f"Primer trimming enabled (cutadapt): "
-                f"-g {args.primer5!r}  -G {args.primer3!r}"
-            )
+            primer_parts = []
+            if args.primer5:
+                primer_parts.append(f"-g {args.primer5!r}")
+            if args.primer3:
+                primer_parts.append(f"-G {args.primer3!r}")
+            print(f"Primer trimming enabled (cutadapt): {' '.join(primer_parts)}")
         print(f"Global dereplicated sequences: {len(global_table)}")
         print(f"Using fast-model threshold: {fast_threshold:.6f}")
 

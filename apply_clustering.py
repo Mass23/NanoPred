@@ -265,6 +265,7 @@ def resolve_fast_threshold(fast_model, fast_metadata: Optional[dict]) -> float:
 
 
 def build_model_input(pair_features: dict, selected_features: Sequence[str]) -> pd.DataFrame:
+    """Build model input for a single pair-feature row."""
     base = pd.DataFrame([pair_features])
     expanded = expand_features(base)
     missing = [feature for feature in selected_features if feature not in expanded.columns]
@@ -355,6 +356,19 @@ def _sequence_bin_from_metrics(metrics: dict) -> Tuple[int, int]:
     )
 
 
+def _gc_content_from_sequence(sequence: str) -> float:
+    if not sequence:
+        return 0.0
+    return 100.0 * float(sequence.count("G") + sequence.count("C")) / float(len(sequence))
+
+
+def _row_temporal_sort_key(row: dict) -> Tuple[int, int, int, str]:
+    sequence = row["sequence"]
+    length_bin = int(len(sequence) // LENGTH_BIN_WIDTH)
+    gc_bin = int(_gc_content_from_sequence(sequence) // GC_BIN_WIDTH)
+    return (-int(row["total_abundance"]), length_bin, gc_bin, sequence)
+
+
 def _select_centroid_indices(
     candidate_metrics: dict,
     centroid_bins: Sequence[Tuple[int, int]],
@@ -402,7 +416,7 @@ def precompute_sequence_metrics(
     bar = tqdm(
         total=len(rows),
         unit="seq",
-        desc="Getting data from sequences",
+        desc="Computing sequence metrics",
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
     )
     for row in rows:
@@ -530,8 +544,8 @@ def greedy_cluster(
                         predicted_identities = full_model.predict(X_full)
 
                         for local_idx, predicted_identity in enumerate(predicted_identities):
-                            predicted_identity = float(predicted_identity)
-                            if predicted_identity < percent_identity:
+                            predicted_identity_value = float(predicted_identity)
+                            if predicted_identity_value < percent_identity:
                                 continue
                             centroid_idx = passed_centroid_idxs[local_idx]
                             centroid_seq = centroids[centroid_idx]
@@ -541,7 +555,7 @@ def greedy_cluster(
                                     "sequence": sequence,
                                     "otu_id": centroid_to_otu[centroid_seq],
                                     "centroid_sequence_id": global_table[centroid_seq]["sequence_id"],
-                                    "predicted_percent_identity": predicted_identity,
+                                    "predicted_percent_identity": predicted_identity_value,
                                     "assignment_type": "fast+full",
                                     "is_centroid": False,
                                     "total_abundance": int(row["total_abundance"]),
@@ -698,17 +712,9 @@ def main() -> None:
         primer3=args.primer3,
     )
 
-    rows = sorted(
-        global_table.values(),
-        key=lambda row: (
-            -int(row["total_abundance"]),
-            int(len(row["sequence"]) // LENGTH_BIN_WIDTH),
-            int((100.0 * (row["sequence"].count("G") + row["sequence"].count("C")) / len(row["sequence"])) // GC_BIN_WIDTH)
-            if row["sequence"]
-            else 0,
-            row["sequence"],
-        ),
-    )
+    # Sort by abundance and coarse length/GC bins to keep similar sequences
+    # temporally close during centroid candidate lookup.
+    rows = sorted(global_table.values(), key=_row_temporal_sort_key)
 
     if args.verbose:
         print("Step 3: getting data from sequences")

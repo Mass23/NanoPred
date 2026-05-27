@@ -12,7 +12,7 @@ from apply_clustering import (
     _run_cutadapt,
     build_otu_table,
     dereplicate_fastq_files,
-    discover_fastq_pairs,
+    discover_fastq_files,
     greedy_cluster,
     resolve_selected_features,
     write_output,
@@ -45,36 +45,32 @@ class TestApplyClustering(unittest.TestCase):
 
     def test_discovery_and_dereplication(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            r1_s1 = os.path.join(tmpdir, "sample1_R1.fastq")
-            r2_s1 = os.path.join(tmpdir, "sample1_R2.fastq")
-            r1_s2 = os.path.join(tmpdir, "sample2_R1.fq.gz")
-            r2_s2 = os.path.join(tmpdir, "sample2_R2.fq.gz")
+            s1 = os.path.join(tmpdir, "sample1.fastq")
+            s2 = os.path.join(tmpdir, "sample2.fq.gz")
             ignore = os.path.join(tmpdir, "ignore.txt")
-            # sample1 R1: two AAAA + one CCCC; sample1 R2: one CCCC
-            self._write_fastq(r1_s1, ["AAAA", "AAAA", "CCCC"], gz=False)
-            self._write_fastq(r2_s1, ["CCCC"], gz=False)
-            # sample2 R1: one AAAA; sample2 R2: one GGGG
-            self._write_fastq(r1_s2, ["AAAA"], gz=True)
-            self._write_fastq(r2_s2, ["GGGG"], gz=True)
+            # sample1: two AAAA + one CCCC
+            self._write_fastq(s1, ["AAAA", "AAAA", "CCCC"], gz=False)
+            # sample2: one AAAA + one GGGG
+            self._write_fastq(s2, ["AAAA", "GGGG"], gz=True)
             with open(ignore, "w", encoding="utf-8") as handle:
                 handle.write("noop")
 
-            pairs = discover_fastq_pairs(tmpdir)
-            self.assertEqual(len(pairs), 2)
-            found_samples = {p[2] for p in pairs}
+            files = discover_fastq_files(tmpdir)
+            self.assertEqual(len(files), 2)
+            found_samples = {f[1] for f in files}
             self.assertIn("sample1", found_samples)
             self.assertIn("sample2", found_samples)
 
-            sample_names, table = dereplicate_fastq_files(pairs)
+            sample_names, table = dereplicate_fastq_files(files)
             self.assertEqual(set(sample_names), {"sample1", "sample2"})
-            # AAAA: 2 from sample1_R1 + 1 from sample2_R1 = 3
+            # AAAA: 2 from sample1 + 1 from sample2 = 3
             self.assertEqual(table["AAAA"]["total_abundance"], 3)
             self.assertEqual(table["AAAA"]["sample_counts"]["sample1"], 2)
             self.assertEqual(table["AAAA"]["sample_counts"]["sample2"], 1)
-            # CCCC: 1 from sample1_R1 + 1 from sample1_R2 = 2
-            self.assertEqual(table["CCCC"]["total_abundance"], 2)
-            self.assertEqual(table["CCCC"]["sample_counts"]["sample1"], 2)
-            # GGGG: 1 from sample2_R2 only
+            # CCCC: 1 from sample1 only
+            self.assertEqual(table["CCCC"]["total_abundance"], 1)
+            self.assertEqual(table["CCCC"]["sample_counts"]["sample1"], 1)
+            # GGGG: 1 from sample2 only
             self.assertEqual(table["GGGG"]["total_abundance"], 1)
             self.assertEqual(table["GGGG"]["sample_counts"]["sample2"], 1)
 
@@ -226,49 +222,51 @@ class TestApplyClustering(unittest.TestCase):
 
 
 class TestCutadaptTrimming(unittest.TestCase):
-    def test_run_cutadapt_builds_paired_end_command(self):
-        """_run_cutadapt should call cutadapt with -g/-G/-o/-p and both inputs."""
+    def test_run_cutadapt_builds_linked_adapter_command(self):
+        """Both primers → linked -g PRIMER5...PRIMER3 with --discard-untrimmed."""
         fake_result = subprocess.CompletedProcess(args=[], returncode=0, stderr=b"")
         with unittest.mock.patch("subprocess.run", return_value=fake_result) as mock_run:
-            _run_cutadapt("r1.fastq", "r2.fastq", "o1.fastq", "o2.fastq", "ACGT", "TGCA")
+            _run_cutadapt("in.fastq", "out.fastq", "ACGT", "TGCA")
             cmd = mock_run.call_args[0][0]
         self.assertEqual(cmd[0], "cutadapt")
         self.assertIn("-g", cmd)
-        self.assertEqual(cmd[cmd.index("-g") + 1], "ACGT")
-        self.assertIn("-G", cmd)
-        self.assertEqual(cmd[cmd.index("-G") + 1], "TGCA")
+        self.assertEqual(cmd[cmd.index("-g") + 1], "ACGT...TGCA")
+        self.assertNotIn("-G", cmd)
+        self.assertNotIn("-p", cmd)
+        self.assertIn("--discard-untrimmed", cmd)
         self.assertIn("-o", cmd)
-        self.assertEqual(cmd[cmd.index("-o") + 1], "o1.fastq")
-        self.assertIn("-p", cmd)
-        self.assertEqual(cmd[cmd.index("-p") + 1], "o2.fastq")
-        self.assertIn("r1.fastq", cmd)
-        self.assertIn("r2.fastq", cmd)
-        # Paired-end mode does not need --rc
-        self.assertNotIn("--rc", cmd)
+        self.assertEqual(cmd[cmd.index("-o") + 1], "out.fastq")
+        self.assertIn("in.fastq", cmd)
 
-    def test_run_cutadapt_only_primer5_no_G_flag(self):
-        """With only primer5 supplied, -G should not appear in the command."""
+    def test_run_cutadapt_only_primer5_uses_g_flag(self):
+        """Only primer5 → -g without linked adapter, discards untrimmed."""
         fake_result = subprocess.CompletedProcess(args=[], returncode=0, stderr=b"")
         with unittest.mock.patch("subprocess.run", return_value=fake_result) as mock_run:
-            _run_cutadapt("r1.fastq", "r2.fastq", "o1.fastq", "o2.fastq", "ACGT", None)
+            _run_cutadapt("in.fastq", "out.fastq", "ACGT", None)
             cmd = mock_run.call_args[0][0]
         self.assertIn("-g", cmd)
+        self.assertEqual(cmd[cmd.index("-g") + 1], "ACGT")
         self.assertNotIn("-G", cmd)
+        self.assertNotIn("-a", cmd)
+        self.assertIn("--discard-untrimmed", cmd)
 
-    def test_run_cutadapt_only_primer3_no_g_flag(self):
-        """With only primer3 supplied, -g should not appear in the command."""
+    def test_run_cutadapt_only_primer3_uses_a_flag(self):
+        """Only primer3 → -a (3' single-end), discards untrimmed."""
         fake_result = subprocess.CompletedProcess(args=[], returncode=0, stderr=b"")
         with unittest.mock.patch("subprocess.run", return_value=fake_result) as mock_run:
-            _run_cutadapt("r1.fastq", "r2.fastq", "o1.fastq", "o2.fastq", None, "TGCA")
+            _run_cutadapt("in.fastq", "out.fastq", None, "TGCA")
             cmd = mock_run.call_args[0][0]
         self.assertNotIn("-g", cmd)
-        self.assertIn("-G", cmd)
+        self.assertNotIn("-G", cmd)
+        self.assertIn("-a", cmd)
+        self.assertEqual(cmd[cmd.index("-a") + 1], "TGCA")
+        self.assertIn("--discard-untrimmed", cmd)
 
     def test_run_cutadapt_raises_when_not_installed(self):
         """FileNotFoundError from subprocess should be re-raised as RuntimeError."""
         with unittest.mock.patch("subprocess.run", side_effect=FileNotFoundError):
             with self.assertRaises(RuntimeError) as ctx:
-                _run_cutadapt("r1.fastq", "r2.fastq", "o1.fastq", "o2.fastq", "ACGT", "TGCA")
+                _run_cutadapt("in.fastq", "out.fastq", "ACGT", "TGCA")
         self.assertIn("cutadapt", str(ctx.exception))
 
     def test_run_cutadapt_raises_on_nonzero_exit(self):
@@ -278,7 +276,7 @@ class TestCutadaptTrimming(unittest.TestCase):
         )
         with unittest.mock.patch("subprocess.run", return_value=failed):
             with self.assertRaises(RuntimeError) as ctx:
-                _run_cutadapt("r1.fastq", "r2.fastq", "o1.fastq", "o2.fastq", "ACGT", "TGCA")
+                _run_cutadapt("in.fastq", "out.fastq", "ACGT", "TGCA")
         self.assertIn("cutadapt", str(ctx.exception))
 
 

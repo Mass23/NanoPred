@@ -9,7 +9,7 @@ import os
 import subprocess
 import tempfile
 import time
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import joblib
 import pandas as pd
@@ -140,6 +140,7 @@ def dereplicate_fastq_files(
     fastq_files: Sequence[Tuple[str, str]],
     primer5: Optional[str] = None,
     primer3: Optional[str] = None,
+    verbose: bool = False,
 ) -> Tuple[List[str], Dict[str, dict]]:
     """Dereplicate reads from single-end FASTQ files, optionally trimming primers.
 
@@ -157,6 +158,7 @@ def dereplicate_fastq_files(
             :func:`discover_fastq_files`.
         primer5: Forward primer for cutadapt 5' trimming (or ``None``).
         primer3: Reverse primer for cutadapt 3' trimming (or ``None``).
+        verbose: If ``True``, prints step labels for trimming and dereplication.
 
     Returns:
         A tuple ``(sample_names, global_table)`` where *sample_names* is the
@@ -167,6 +169,10 @@ def dereplicate_fastq_files(
     """
     sample_names: List[str] = []
     global_table: Dict[str, dict] = {}
+
+    if verbose:
+        print("Step 1: cutting primers")
+        print("Step 2: dereplication")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for path, sample_name in fastq_files:
@@ -264,9 +270,14 @@ def resolve_fast_threshold(fast_model, fast_metadata: Optional[dict]) -> float:
     return 0.5
 
 
-def build_model_input(pair_features: dict, selected_features: Sequence[str]) -> pd.DataFrame:
-    """Build model input for a single pair-feature row."""
-    base = pd.DataFrame([pair_features])
+def build_model_input(
+    pair_features: Union[dict, pd.DataFrame], selected_features: Sequence[str]
+) -> pd.DataFrame:
+    """Build model input from a pair-feature dict or DataFrame."""
+    if isinstance(pair_features, pd.DataFrame):
+        base = pair_features
+    else:
+        base = pd.DataFrame([pair_features])
     expanded = expand_features(base)
     missing = [feature for feature in selected_features if feature not in expanded.columns]
     if missing:
@@ -458,6 +469,11 @@ def get_full_data(
     return full_expanded[list(full_features)], validate_columns
 
 
+def compute_sequence_metrics_cache(global_table: Dict[str, dict]) -> Dict[str, dict]:
+    """Backward-compatible helper for tests and direct API callers."""
+    return precompute_sequence_metrics(list(global_table.values()), verbose=False)
+
+
 def greedy_cluster(
     global_table: Dict[str, dict],
     fast_model,
@@ -469,6 +485,7 @@ def greedy_cluster(
     min_clusters: int = 20,
     rows: Optional[Sequence[dict]] = None,
     sequence_metrics: Optional[Dict[str, dict]] = None,
+    metric_cache: Optional[Dict[str, dict]] = None,
 ) -> List[dict]:
     if rows is None:
         rows = sorted(
@@ -476,7 +493,7 @@ def greedy_cluster(
             key=lambda row: (-int(row["total_abundance"]), row["sequence"]),
         )
     if sequence_metrics is None:
-        sequence_metrics = precompute_sequence_metrics(rows, verbose=False)
+        sequence_metrics = metric_cache if metric_cache is not None else precompute_sequence_metrics(rows, verbose=False)
 
     fast_base_features = _required_base_features(fast_features)
     full_base_features = _required_base_features(full_features)
@@ -491,7 +508,7 @@ def greedy_cluster(
     fast_columns_validated = False
     full_columns_validated = False
 
-    with tqdm(total=len(rows), unit="seq", desc="Assigning OTUs") as pbar:
+    with tqdm(total=len(rows), unit="seq", desc="Step 4: OTU clustering (OTUs=0)") as pbar:
         for row in rows:
             sequence = row["sequence"]
             candidate_metrics = sequence_metrics[sequence]
@@ -589,7 +606,7 @@ def greedy_cluster(
                     }
                 )
 
-            pbar.set_description(f"Assigning OTUs: {otu_count} OTUs")
+            pbar.set_description(f"Step 4: OTU clustering (OTUs={otu_count})")
             pbar.update(1)
 
     return clustered_rows
@@ -710,14 +727,13 @@ def main() -> None:
         fastq_files,
         primer5=args.primer5,
         primer3=args.primer3,
+        verbose=args.verbose,
     )
-
+    if args.verbose:
+        print("Step 3: getting data from sequences")
     # Sort by abundance and coarse length/GC bins to keep similar sequences
     # temporally close during centroid candidate lookup.
     rows = sorted(global_table.values(), key=_row_temporal_sort_key)
-
-    if args.verbose:
-        print("Step 3: getting data from sequences")
     sequence_metrics = precompute_sequence_metrics(rows, verbose=args.verbose)
     if args.verbose:
         print("Step 4: OTU clustering")
@@ -737,6 +753,7 @@ def main() -> None:
             print(f"Primer trimming enabled (cutadapt): {' '.join(primer_parts)}")
         print(f"Global dereplicated sequences: {len(global_table)}")
         print(f"Using fast-model threshold: {fast_threshold:.6f}")
+        print("Step 4: OTU clustering")
 
     clustered_rows = greedy_cluster(
         rows=rows,

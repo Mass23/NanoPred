@@ -8,18 +8,31 @@ import json
 import os
 import subprocess
 import tempfile
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+import time
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import joblib
 import pandas as pd
 from Bio import SeqIO
 from tqdm import tqdm
 
-from src.data_creation import compute_metrics, compute_pair_features, rna_to_dna
+from src.data_creation import compute_metrics, jaccard_similarity, rna_to_dna
 from train_model import _get_classifier_scores, expand_features
 
 
 SUPPORTED_FASTQ_EXTENSIONS = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
+SCALAR_PAIR_BASES = (
+    "length",
+    "quality_mean",
+    "quality_median",
+    "quality_q25",
+    "quality_q75",
+    "gc_content",
+)
+LENGTH_BIN_WIDTH = 50
+GC_BIN_WIDTH = 5.0
+WARMUP_ALL_CENTROIDS = 10
+CLOSEST_CENTROID_FRACTION = 0.35
 
 
 def _run_cutadapt(
@@ -260,6 +273,7 @@ def resolve_fast_threshold(fast_model, fast_metadata: Optional[dict]) -> float:
 def build_model_input(
     pair_features: Union[dict, pd.DataFrame], selected_features: Sequence[str]
 ) -> pd.DataFrame:
+    """Build model input from a pair-feature dict or DataFrame."""
     if isinstance(pair_features, pd.DataFrame):
         base = pair_features
     else:
@@ -276,79 +290,305 @@ def build_model_input(
     return expanded[list(selected_features)]
 
 
-def compute_sequence_metrics_cache(global_table: Dict[str, dict]) -> Dict[str, dict]:
-    """Compute metrics once per dereplicated unique sequence."""
+def _base_feature_name(feature_name: str) -> str:
+    if feature_name.endswith("__log"):
+        return feature_name[:-5]
+    if feature_name.endswith("__sqrt"):
+        return feature_name[:-6]
+    return feature_name
+
+
+def _required_base_features(selected_features: Sequence[str]) -> Set[str]:
+    return {_base_feature_name(feature) for feature in selected_features}
+
+
+def _compute_pair_feature_subset(
+    candidate_metrics: dict,
+    centroid_metrics: dict,
+    required_base_features: Set[str],
+) -> dict:
+    features: Dict[str, float] = {}
+
+    for feature in required_base_features:
+        if feature.startswith("quality_jaccard_"):
+            bits = feature.rsplit("_", 1)[-1]
+            key = f"quality_hash_{bits}"
+            features[feature] = jaccard_similarity(
+                candidate_metrics[key],
+                centroid_metrics[key],
+            )
+            continue
+
+        if feature.startswith("kmer_") and "_hashjaccard_" in feature:
+            stem = feature.replace("_hashjaccard_", "_sketch_")
+            features[feature] = jaccard_similarity(
+                candidate_metrics[stem],
+                centroid_metrics[stem],
+            )
+            continue
+
+        for suffix in ("_min", "_max", "_diff", "_mean"):
+            if feature.endswith(suffix):
+                scalar_name = feature[: -len(suffix)]
+                if scalar_name not in SCALAR_PAIR_BASES:
+                    break
+                v1 = float(candidate_metrics[scalar_name])
+                v2 = float(centroid_metrics[scalar_name])
+                lo, hi = (v1, v2) if v1 <= v2 else (v2, v1)
+                if suffix == "_min":
+                    features[feature] = lo
+                elif suffix == "_max":
+                    features[feature] = hi
+                elif suffix == "_diff":
+                    features[feature] = hi - lo
+                else:
+                    features[feature] = (v1 + v2) / 2.0
+                break
+
+    return features
+
+
+def _validate_selected_features(expanded_columns: Sequence[str], selected_features: Sequence[str]) -> None:
+    available_set = set(expanded_columns)
+    missing = [feature for feature in selected_features if feature not in available_set]
+    if missing:
+        suffix = f" (showing first 10 of {len(missing)} total)" if len(missing) > 10 else ""
+        shown = ", ".join(missing[:10])
+        available = ", ".join(expanded_columns)
+        raise ValueError(
+            f"Missing expected model features after expansion: {shown}{suffix}. Available features: {available}"
+        )
+
+
+def _sequence_bin_from_metrics(metrics: dict) -> Tuple[int, int]:
+    return (
+        int(float(metrics["length"]) // LENGTH_BIN_WIDTH),
+        int(float(metrics["gc_content"]) // GC_BIN_WIDTH),
+    )
+
+
+def _gc_content_from_sequence(sequence: str) -> float:
+    if not sequence:
+        return 0.0
+    return 100.0 * float(sequence.count("G") + sequence.count("C")) / float(len(sequence))
+
+
+def _row_temporal_sort_key(row: dict) -> Tuple[int, int, int, str]:
+    sequence = row["sequence"]
+    length_bin = int(len(sequence) // LENGTH_BIN_WIDTH)
+    gc_bin = int(_gc_content_from_sequence(sequence) // GC_BIN_WIDTH)
+    return (-int(row["total_abundance"]), length_bin, gc_bin, sequence)
+
+
+def _select_centroid_indices(
+    candidate_metrics: dict,
+    centroid_bins: Sequence[Tuple[int, int]],
+    centroid_lengths: Sequence[float],
+    centroid_gcs: Sequence[float],
+    min_clusters: int,
+) -> List[int]:
+    n_centroids = len(centroid_bins)
+    if n_centroids <= WARMUP_ALL_CENTROIDS:
+        return list(range(n_centroids))
+
+    keep_n = max(int(min_clusters), int(n_centroids * CLOSEST_CENTROID_FRACTION))
+    keep_n = min(keep_n, n_centroids)
+    if keep_n >= n_centroids:
+        return list(range(n_centroids))
+
+    cand_len = float(candidate_metrics["length"])
+    cand_gc = float(candidate_metrics["gc_content"])
+    cand_bin_len, cand_bin_gc = _sequence_bin_from_metrics(candidate_metrics)
+
+    ranked = sorted(
+        range(n_centroids),
+        key=lambda idx: (
+            abs(centroid_bins[idx][0] - cand_bin_len) + abs(centroid_bins[idx][1] - cand_bin_gc),
+            abs(centroid_lengths[idx] - cand_len),
+            abs(centroid_gcs[idx] - cand_gc),
+            idx,
+        ),
+    )
+    return sorted(ranked[:keep_n])
+
+
+def precompute_sequence_metrics(
+    rows: Sequence[dict],
+    verbose: bool = False,
+) -> Dict[str, dict]:
     metric_cache: Dict[str, dict] = {}
-    for sequence, row in global_table.items():
+    if not verbose:
+        for row in rows:
+            sequence = row["sequence"]
+            metric_cache[sequence] = compute_metrics(sequence, row["representative_quality"])
+        return metric_cache
+
+    started = time.perf_counter()
+    bar = tqdm(
+        total=len(rows),
+        unit="seq",
+        desc="Computing sequence metrics",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    )
+    for row in rows:
+        sequence = row["sequence"]
         metric_cache[sequence] = compute_metrics(sequence, row["representative_quality"])
+        bar.update(1)
+    elapsed = time.perf_counter() - started
+    bar.set_postfix_str(f"elapsed={elapsed:.1f}s")
+    bar.close()
     return metric_cache
+
+
+def get_full_data(
+    fast_pair_df: pd.DataFrame,
+    row_indices: Sequence[int],
+    centroid_metric_indices: Sequence[int],
+    candidate_metrics: dict,
+    centroid_metrics: Sequence[dict],
+    full_base_features: Set[str],
+    full_features: Sequence[str],
+    validate_columns: bool,
+) -> Tuple[pd.DataFrame, bool]:
+    full_pair_df = fast_pair_df.iloc[list(row_indices)].copy()
+    missing_base = [feature for feature in full_base_features if feature not in full_pair_df.columns]
+    if missing_base:
+        for local_idx, centroid_idx in enumerate(centroid_metric_indices):
+            extra = _compute_pair_feature_subset(
+                candidate_metrics,
+                centroid_metrics[centroid_idx],
+                set(missing_base),
+            )
+            for key, value in extra.items():
+                full_pair_df.at[full_pair_df.index[local_idx], key] = value
+
+    full_expanded = expand_features(full_pair_df)
+    if validate_columns:
+        _validate_selected_features(full_expanded.columns.tolist(), full_features)
+        validate_columns = False
+    return full_expanded[list(full_features)], validate_columns
+
+
+def compute_sequence_metrics_cache(global_table: Dict[str, dict]) -> Dict[str, dict]:
+    """Backward-compatible helper for tests and direct API callers."""
+    return precompute_sequence_metrics(list(global_table.values()), verbose=False)
 
 
 def greedy_cluster(
     global_table: Dict[str, dict],
-    metric_cache: Dict[str, dict],
     fast_model,
     full_model,
     fast_features: Sequence[str],
     full_features: Sequence[str],
     fast_threshold: float,
     percent_identity: float,
+    min_clusters: int = 20,
+    rows: Optional[Sequence[dict]] = None,
+    sequence_metrics: Optional[Dict[str, dict]] = None,
+    metric_cache: Optional[Dict[str, dict]] = None,
 ) -> List[dict]:
-    rows = sorted(
-        global_table.values(),
-        key=lambda row: (-int(row["total_abundance"]), row["sequence"]),
-    )
+    if rows is None:
+        rows = sorted(
+            global_table.values(),
+            key=lambda row: (-int(row["total_abundance"]), row["sequence"]),
+        )
+    if sequence_metrics is None:
+        sequence_metrics = metric_cache if metric_cache is not None else precompute_sequence_metrics(rows, verbose=False)
 
+    fast_base_features = _required_base_features(fast_features)
+    full_base_features = _required_base_features(full_features)
     centroids: List[str] = []
     centroid_to_otu: Dict[str, str] = {}
+    centroid_metrics: List[dict] = []
+    centroid_bins: List[Tuple[int, int]] = []
+    centroid_lengths: List[float] = []
+    centroid_gcs: List[float] = []
     clustered_rows: List[dict] = []
     otu_count = 0
+    fast_columns_validated = False
+    full_columns_validated = False
 
     with tqdm(total=len(rows), unit="seq", desc="Step 4: OTU clustering (OTUs=0)") as pbar:
         for row in rows:
             sequence = row["sequence"]
-            candidate_metrics = metric_cache[sequence]
+            candidate_metrics = sequence_metrics[sequence]
 
             assigned = False
             if centroids:
-                pair_rows = [
-                    compute_pair_features(candidate_metrics, metric_cache[centroid_seq])
-                    for centroid_seq in centroids
-                ]
-                pair_df = pd.DataFrame(pair_rows)
-                X_fast = build_model_input(pair_df, fast_features)
-                fast_scores = _get_classifier_scores(fast_model, X_fast)
-                pass_idx = [
-                    idx for idx, score in enumerate(fast_scores) if float(score) >= fast_threshold
-                ]
-
-                if pass_idx:
-                    full_pair_df = pair_df.iloc[pass_idx].reset_index(drop=True)
-                    X_full = build_model_input(full_pair_df, full_features)
-                    predicted_identities = full_model.predict(X_full)
-
-                    for centroid_idx, predicted_identity in zip(pass_idx, predicted_identities):
-                        if float(predicted_identity) < percent_identity:
-                            continue
-                        centroid_seq = centroids[centroid_idx]
-                        clustered_rows.append(
-                            {
-                                "sequence_id": row["sequence_id"],
-                                "sequence": sequence,
-                                "otu_id": centroid_to_otu[centroid_seq],
-                                "centroid_sequence_id": global_table[centroid_seq]["sequence_id"],
-                                "predicted_percent_identity": float(predicted_identity),
-                                "assignment_type": "fast+full",
-                                "is_centroid": False,
-                                "total_abundance": int(row["total_abundance"]),
-                                "sample_counts": row["sample_counts"],
-                            }
+                candidate_centroid_idxs = _select_centroid_indices(
+                    candidate_metrics=candidate_metrics,
+                    centroid_bins=centroid_bins,
+                    centroid_lengths=centroid_lengths,
+                    centroid_gcs=centroid_gcs,
+                    min_clusters=min_clusters,
+                )
+                if candidate_centroid_idxs:
+                    fast_rows = [
+                        _compute_pair_feature_subset(
+                            candidate_metrics,
+                            centroid_metrics[idx],
+                            fast_base_features,
                         )
-                        assigned = True
-                        break
+                        for idx in candidate_centroid_idxs
+                    ]
+                    fast_pair_df = pd.DataFrame(fast_rows)
+                    fast_expanded = expand_features(fast_pair_df)
+
+                    if not fast_columns_validated:
+                        _validate_selected_features(fast_expanded.columns.tolist(), fast_features)
+                        fast_columns_validated = True
+
+                    X_fast = fast_expanded[list(fast_features)]
+                    fast_scores = _get_classifier_scores(fast_model, X_fast)
+                    passed_local_idxs = [
+                        local_idx
+                        for local_idx, score in enumerate(fast_scores)
+                        if float(score) >= fast_threshold
+                    ]
+
+                    if passed_local_idxs:
+                        passed_centroid_idxs = [candidate_centroid_idxs[idx] for idx in passed_local_idxs]
+                        X_full, full_columns_validated = get_full_data(
+                            fast_pair_df=fast_pair_df,
+                            row_indices=passed_local_idxs,
+                            centroid_metric_indices=passed_centroid_idxs,
+                            candidate_metrics=candidate_metrics,
+                            centroid_metrics=centroid_metrics,
+                            full_base_features=full_base_features,
+                            full_features=full_features,
+                            validate_columns=not full_columns_validated,
+                        )
+                        predicted_identities = full_model.predict(X_full)
+
+                        for local_idx, predicted_identity in enumerate(predicted_identities):
+                            predicted_identity_value = float(predicted_identity)
+                            if predicted_identity_value < percent_identity:
+                                continue
+                            centroid_idx = passed_centroid_idxs[local_idx]
+                            centroid_seq = centroids[centroid_idx]
+                            clustered_rows.append(
+                                {
+                                    "sequence_id": row["sequence_id"],
+                                    "sequence": sequence,
+                                    "otu_id": centroid_to_otu[centroid_seq],
+                                    "centroid_sequence_id": global_table[centroid_seq]["sequence_id"],
+                                    "predicted_percent_identity": predicted_identity_value,
+                                    "assignment_type": "fast+full",
+                                    "is_centroid": False,
+                                    "total_abundance": int(row["total_abundance"]),
+                                    "sample_counts": row["sample_counts"],
+                                }
+                            )
+                            assigned = True
+                            break
 
             if not assigned:
                 centroids.append(sequence)
+                centroid_metric = sequence_metrics[sequence]
+                centroid_metrics.append(centroid_metric)
+                centroid_bins.append(_sequence_bin_from_metrics(centroid_metric))
+                centroid_lengths.append(float(centroid_metric["length"]))
+                centroid_gcs.append(float(centroid_metric["gc_content"]))
                 otu_count += 1
                 otu_id = f"OTU_{otu_count}"
                 centroid_to_otu[sequence] = otu_id
@@ -455,11 +695,22 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Reverse primer sequence (cutadapt -a, trimmed from 3' end before dereplication).",
     )
+    parser.add_argument(
+        "--min-clusters",
+        type=int,
+        default=20,
+        help=(
+            "Minimum number of nearest-centroid candidates considered once clustering warms up; "
+            "used with length/GC bin prefiltering."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.min_clusters < 1:
+        raise ValueError("--min-clusters must be >= 1.")
 
     fast_model, full_model, fast_meta, full_meta = load_models_and_metadata(args.model_dir)
     fast_features = resolve_selected_features(fast_model, fast_meta, "fast model")
@@ -467,6 +718,11 @@ def main() -> None:
     fast_threshold = resolve_fast_threshold(fast_model, fast_meta)
 
     fastq_files = discover_fastq_files(args.input_dir)
+    if args.verbose:
+        print("Step 1: cutting primers")
+        if not (args.primer5 or args.primer3):
+            print("  Primer trimming disabled (no primers provided).")
+        print("Step 2: dereplication")
     sample_names, global_table = dereplicate_fastq_files(
         fastq_files,
         primer5=args.primer5,
@@ -475,7 +731,12 @@ def main() -> None:
     )
     if args.verbose:
         print("Step 3: getting data from sequences")
-    metric_cache = compute_sequence_metrics_cache(global_table)
+    # Sort by abundance and coarse length/GC bins to keep similar sequences
+    # temporally close during centroid candidate lookup.
+    rows = sorted(global_table.values(), key=_row_temporal_sort_key)
+    sequence_metrics = precompute_sequence_metrics(rows, verbose=args.verbose)
+    if args.verbose:
+        print("Step 4: OTU clustering")
 
     if args.verbose:
         print(f"Loaded {len(fastq_files)} FASTQ file(s):")
@@ -495,14 +756,16 @@ def main() -> None:
         print("Step 4: OTU clustering")
 
     clustered_rows = greedy_cluster(
+        rows=rows,
         global_table=global_table,
-        metric_cache=metric_cache,
+        sequence_metrics=sequence_metrics,
         fast_model=fast_model,
         full_model=full_model,
         fast_features=fast_features,
         full_features=full_features,
         fast_threshold=fast_threshold,
         percent_identity=float(args.percent_identity),
+        min_clusters=int(args.min_clusters),
     )
     assignments_path, otu_table_path = write_output(clustered_rows, sample_names, args.output)
 
